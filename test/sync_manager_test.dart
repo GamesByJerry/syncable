@@ -252,14 +252,89 @@ void main() {
       expect(syncManager.isSyncingToBackend, isFalse);
       expect(syncManager.nSyncedToBackend(Item), 1);
 
-      // Update the item to trigger a sync
+      // Update the item to trigger a sync. A local edit must mark the row
+      // dirty=true (the app gets this via Syncable.toCompanion()); without it
+      // the dirty-flag engine correctly treats the row as already in sync.
       await (testDb.update(testDb.items)
             ..where((i) => i.rowId.equals(itemRowId)))
-          .write(ItemsCompanion(updatedAt: drift.Value(DateTime.now())));
+          .write(
+            ItemsCompanion(
+              updatedAt: drift.Value(DateTime.now()),
+              dirty: const drift.Value(true),
+            ),
+          );
 
       await waitForFunctionToPass(() async {
         expect(syncManager.nSyncedToBackend(Item), 2);
       });
+    },
+  );
+
+  test(
+    'A restart does not re-push pulled rows; only dirty local rows push',
+    () async {
+      // A co-member's row pulled in a PREVIOUS session: it sits in the local DB
+      // dirty=false and is owned by another user. (This is the circle row a
+      // non-owner member pulls — re-pushing it fails RLS with 42501.)
+      final pulledId = const Uuid().v4();
+      await testDb
+          .into(testDb.items)
+          .insert(
+            ItemsCompanion.insert(
+              id: drift.Value(pulledId),
+              userId: drift.Value(const Uuid().v4()),
+              updatedAt: DateTime.now(),
+              deleted: const drift.Value(false),
+              dirty: const drift.Value(false),
+              name: 'pulled co-member row',
+            ),
+          );
+
+      final myUserId = const Uuid().v4();
+      // A genuine local edit by us: dirty=true.
+      await testDb
+          .into(testDb.items)
+          .insert(
+            ItemsCompanion.insert(
+              id: drift.Value(const Uuid().v4()),
+              userId: drift.Value(myUserId),
+              updatedAt: DateTime.now(),
+              deleted: const drift.Value(false),
+              dirty: const drift.Value(true),
+              name: 'my local row',
+            ),
+          );
+
+      // Fresh SyncManager == app restart: the in-memory received/sent sets that
+      // used to guard against echoing pulled rows are empty. Only the persistent
+      // dirty flag can prevent the re-push now.
+      final syncManager = SyncManager(
+        localDatabase: testDb,
+        supabaseClient: mockSupabaseClient,
+        syncInterval: const Duration(milliseconds: 1),
+      );
+      syncManager.registerSyncable<Item>(
+        backendTable: itemsTable,
+        fromJson: Item.fromJson,
+        companionConstructor: ItemsCompanion.new,
+      );
+      syncManager.setUserId(myUserId);
+      syncManager.enableSync();
+
+      // Only the dirty row is ever pushed.
+      await waitForFunctionToPass(() async {
+        expect(syncManager.nSyncedToBackend(Item), 1);
+      });
+
+      // ...and it stays 1 across an explicit re-sync — the pulled row never goes.
+      await syncManager.syncTables();
+      expect(syncManager.nSyncedToBackend(Item), 1);
+
+      // After a successful push the local row is marked clean; the pulled row
+      // was already clean. So nothing is left dirty to re-push.
+      final rows = await testDb.select(testDb.items).get();
+      expect(rows.length, 2);
+      expect(rows.every((r) => r.dirty == false), isTrue);
     },
   );
 

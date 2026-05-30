@@ -351,6 +351,12 @@ class SyncManager<T extends SyncableDatabase> {
 
     for (final row
         in rows
+            // Only push rows with unpushed LOCAL changes. A row pulled from the
+            // backend is written with dirty=false, so it is never echoed back —
+            // even across an app restart (the in-memory receivedItems set does
+            // not survive that, the persistent dirty column does). This is what
+            // stops non-owner co-member rows re-pushing and failing RLS.
+            .where((r) => r.dirty)
             .where((r) => !receivedItems.contains(r))
             .where(updateHasNotBeenSentYet)) {
       outQueue[row.id] = row;
@@ -575,6 +581,7 @@ class SyncManager<T extends SyncableDatabase> {
     final outQueue = _outQueues[syncable]!;
     final backendTable = _backendTables[syncable]!;
     final sentItems = _sentItems[syncable]!;
+    final table = _localTables[syncable]!;
 
     while (_syncingEnabled && outQueue.isNotEmpty) {
       // GAM-389: push every queued row regardless of owner; RLS authorizes the
@@ -599,6 +606,25 @@ class SyncManager<T extends SyncableDatabase> {
           );
 
       sentItems.addAll(outgoing);
+
+      // The pushed rows are now in sync with the backend — clear their dirty
+      // flag so they are not re-pushed next cycle / after a restart. Guard each
+      // clear on the exact updatedAt we pushed: if the user edited the row again
+      // while this batch was in flight, its updatedAt has moved on, the match
+      // fails, dirty stays true, and the newer edit pushes next cycle.
+      final cleanCompanion =
+          _companions[syncable]!(dirty: const Value(false))
+              as UpdateCompanion<Syncable>;
+      await _localDb.batch((batch) {
+        for (final row in outgoing) {
+          batch.update(
+            table,
+            cleanCompanion,
+            where: (tbl) =>
+                tbl.id.equals(row.id) & tbl.updatedAt.equals(row.updatedAt),
+          );
+        }
+      });
 
       _nSyncedToBackend[syncable] =
           nSyncedToBackend(syncable) + outgoing.length;
@@ -657,19 +683,43 @@ class SyncManager<T extends SyncableDatabase> {
 
     final itemsToInsert = <UpdateCompanion<Syncable>>[];
     final itemsToReplace = <UpdateCompanion<Syncable>>[];
+    final writtenIds = <String>[];
 
     for (final incomingItem in incomingItems.values) {
       final existingUpdatedAt = existingItems[incomingItem.id];
       if (existingUpdatedAt == null) {
         itemsToInsert.add(incomingItem.toCompanion());
+        writtenIds.add(incomingItem.id);
       } else if (incomingItem.updatedAt.isAfter(existingUpdatedAt)) {
         itemsToReplace.add(incomingItem.toCompanion());
+        writtenIds.add(incomingItem.id);
       }
+      // else: local copy is newer — leave it (and its dirty flag) untouched so a
+      // pending local edit still gets pushed.
     }
 
-    await _localDb.batch((batch) {
-      batch.insertAll(table, itemsToInsert);
-      batch.replaceAll(table, itemsToReplace);
+    // A pulled row is not a local change. toCompanion() defaults dirty=true (so
+    // the app's own writes are pushed), so the incoming write must clear it —
+    // otherwise the next sync would push the row straight back to the backend.
+    //
+    // Do the write + clear in ONE transaction so the local-change stream only
+    // ever observes the final state (dirty=false). Without the transaction the
+    // intermediate dirty=true write could be picked up by the local-changes
+    // subscription and queued for push before we clear it.
+    await _localDb.transaction(() async {
+      await _localDb.batch((batch) {
+        batch.insertAll(table, itemsToInsert);
+        batch.replaceAll(table, itemsToReplace);
+      });
+
+      if (writtenIds.isNotEmpty) {
+        final cleanCompanion =
+            _companions[syncable]!(dirty: const Value(false))
+                as UpdateCompanion<S>;
+        await (_localDb.update(
+          table,
+        )..where((tbl) => tbl.id.isIn(writtenIds))).write(cleanCompanion);
+      }
     });
   }
 
@@ -732,6 +782,7 @@ typedef CompanionConstructor =
       Value<String?> userId,
       Value<DateTime> updatedAt,
       Value<bool> deleted,
+      Value<bool> dirty,
     });
 
 enum TimestampType {
