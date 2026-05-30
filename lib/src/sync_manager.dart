@@ -327,7 +327,9 @@ class SyncManager<T extends SyncableDatabase> {
     for (final syncable in _syncables) {
       _localSubscriptions[syncable] = _localDb.subscribe(
         table: _localTables[syncable]!,
-        filter: (SyncableTable row) => row.userId.equals(_userId),
+        // GAM-389: RLS-trusting — watch ALL local rows, not just this user's,
+        // so a co-member-owned row still pushes when locally edited.
+        filter: (SyncableTable row) => const Constant<bool>(true),
         onChange: (rows) {
           if (_syncingEnabled) {
             _pushLocalChangesToOutQueue(syncable, rows.cast());
@@ -399,11 +401,8 @@ class SyncManager<T extends SyncableDatabase> {
             _inQueues[syncable]!.add(item);
           }
         },
-        filter: PostgresChangeFilter(
-          type: PostgresChangeFilterType.eq,
-          column: userIdKey,
-          value: _userId,
-        ),
+        // GAM-389: no user_id filter — Postgres Changes only delivers rows the
+        // client may read under RLS, which already scopes to the user's circles.
       );
     }
 
@@ -459,10 +458,9 @@ class SyncManager<T extends SyncableDatabase> {
     if (!_syncingEnabled) return;
 
     assert(_userId.isNotEmpty);
-    _pushLocalChangesToOutQueue(
-      syncable,
-      localItems.where((i) => i.userId == _userId),
-    );
+    // GAM-389: push ALL local rows, not just this user's. The updatedAt /
+    // receivedItems dedup below still guards against echoing pulled rows.
+    _pushLocalChangesToOutQueue(syncable, localItems);
 
     if (_skipSyncFromBackend(syncable)) {
       _logger.info(
@@ -494,7 +492,7 @@ class SyncManager<T extends SyncableDatabase> {
       final pulledBatch = await _supabaseClient
           .from(_backendTables[syncable]!)
           .select()
-          .eq(userIdKey, _userId)
+          // GAM-389: no user_id filter — pull whatever RLS permits.
           .inFilter(idKey, batch)
           .then((data) => data.map(_fromJsons[syncable]!));
 
@@ -535,7 +533,7 @@ class SyncManager<T extends SyncableDatabase> {
       final batch = await _supabaseClient
           .from(_backendTables[syncable]!)
           .select('$idKey,$updatedAtKey')
-          .eq(userIdKey, _userId)
+          // GAM-389: no user_id filter — metadata for all RLS-visible rows.
           .range(offset, offset + _maxRows - 1)
           // Use consistent ordering to prevent duplicates
           .order(idKey, ascending: true);
@@ -579,9 +577,9 @@ class SyncManager<T extends SyncableDatabase> {
     final sentItems = _sentItems[syncable]!;
 
     while (_syncingEnabled && outQueue.isNotEmpty) {
-      final outgoing = Set<Syncable>.from(
-        outQueue.values.where((f) => f.userId == _userId),
-      );
+      // GAM-389: push every queued row regardless of owner; RLS authorizes the
+      // write and onConflict:id makes it an idempotent upsert.
+      final outgoing = Set<Syncable>.from(outQueue.values);
       outQueue.clear();
 
       if (outgoing.isEmpty) continue;
@@ -596,7 +594,8 @@ class SyncManager<T extends SyncableDatabase> {
           .from(backendTable)
           .upsert(
             outgoing.map((x) => x.toJson()).toList(),
-            onConflict: '$idKey,$userIdKey',
+            // GAM-389: conflict on id alone — one row per entity, not per user.
+            onConflict: idKey,
           );
 
       sentItems.addAll(outgoing);
