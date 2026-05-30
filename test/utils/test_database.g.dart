@@ -59,6 +59,19 @@ class $ItemsTable extends Items with TableInfo<$ItemsTable, Item> {
     ),
     defaultValue: const Constant(false),
   );
+  static const VerificationMeta _dirtyMeta = const VerificationMeta('dirty');
+  @override
+  late final GeneratedColumn<bool> dirty = GeneratedColumn<bool>(
+    'dirty',
+    aliasedName,
+    false,
+    type: DriftSqlType.bool,
+    requiredDuringInsert: false,
+    defaultConstraints: GeneratedColumn.constraintIsAlways(
+      'CHECK ("dirty" IN (0, 1))',
+    ),
+    defaultValue: const Constant(true),
+  );
   static const VerificationMeta _nameMeta = const VerificationMeta('name');
   @override
   late final GeneratedColumn<String> name = GeneratedColumn<String>(
@@ -73,7 +86,14 @@ class $ItemsTable extends Items with TableInfo<$ItemsTable, Item> {
     requiredDuringInsert: true,
   );
   @override
-  List<GeneratedColumn> get $columns => [id, userId, updatedAt, deleted, name];
+  List<GeneratedColumn> get $columns => [
+    id,
+    userId,
+    updatedAt,
+    deleted,
+    dirty,
+    name,
+  ];
   @override
   String get aliasedName => _alias ?? actualTableName;
   @override
@@ -107,6 +127,12 @@ class $ItemsTable extends Items with TableInfo<$ItemsTable, Item> {
       context.handle(
         _deletedMeta,
         deleted.isAcceptableOrUnknown(data['deleted']!, _deletedMeta),
+      );
+    }
+    if (data.containsKey('dirty')) {
+      context.handle(
+        _dirtyMeta,
+        dirty.isAcceptableOrUnknown(data['dirty']!, _dirtyMeta),
       );
     }
     if (data.containsKey('name')) {
@@ -146,6 +172,10 @@ class $ItemsTable extends Items with TableInfo<$ItemsTable, Item> {
         DriftSqlType.string,
         data['${effectivePrefix}name'],
       )!,
+      dirty: attachedDatabase.typeMapping.read(
+        DriftSqlType.bool,
+        data['${effectivePrefix}dirty'],
+      )!,
     );
   }
 
@@ -160,6 +190,7 @@ class ItemsCompanion extends UpdateCompanion<Item> {
   final Value<String?> userId;
   final Value<DateTime> updatedAt;
   final Value<bool> deleted;
+  final Value<bool> dirty;
   final Value<String> name;
   final Value<int> rowid;
   const ItemsCompanion({
@@ -167,6 +198,7 @@ class ItemsCompanion extends UpdateCompanion<Item> {
     this.userId = const Value.absent(),
     this.updatedAt = const Value.absent(),
     this.deleted = const Value.absent(),
+    this.dirty = const Value.absent(),
     this.name = const Value.absent(),
     this.rowid = const Value.absent(),
   });
@@ -175,6 +207,7 @@ class ItemsCompanion extends UpdateCompanion<Item> {
     this.userId = const Value.absent(),
     required DateTime updatedAt,
     this.deleted = const Value.absent(),
+    this.dirty = const Value.absent(),
     required String name,
     this.rowid = const Value.absent(),
   }) : updatedAt = Value(updatedAt),
@@ -184,6 +217,7 @@ class ItemsCompanion extends UpdateCompanion<Item> {
     Expression<String>? userId,
     Expression<DateTime>? updatedAt,
     Expression<bool>? deleted,
+    Expression<bool>? dirty,
     Expression<String>? name,
     Expression<int>? rowid,
   }) {
@@ -192,6 +226,7 @@ class ItemsCompanion extends UpdateCompanion<Item> {
       if (userId != null) 'user_id': userId,
       if (updatedAt != null) 'updated_at': updatedAt,
       if (deleted != null) 'deleted': deleted,
+      if (dirty != null) 'dirty': dirty,
       if (name != null) 'name': name,
       if (rowid != null) 'rowid': rowid,
     });
@@ -202,6 +237,7 @@ class ItemsCompanion extends UpdateCompanion<Item> {
     Value<String?>? userId,
     Value<DateTime>? updatedAt,
     Value<bool>? deleted,
+    Value<bool>? dirty,
     Value<String>? name,
     Value<int>? rowid,
   }) {
@@ -210,6 +246,7 @@ class ItemsCompanion extends UpdateCompanion<Item> {
       userId: userId ?? this.userId,
       updatedAt: updatedAt ?? this.updatedAt,
       deleted: deleted ?? this.deleted,
+      dirty: dirty ?? this.dirty,
       name: name ?? this.name,
       rowid: rowid ?? this.rowid,
     );
@@ -230,6 +267,9 @@ class ItemsCompanion extends UpdateCompanion<Item> {
     if (deleted.present) {
       map['deleted'] = Variable<bool>(deleted.value);
     }
+    if (dirty.present) {
+      map['dirty'] = Variable<bool>(dirty.value);
+    }
     if (name.present) {
       map['name'] = Variable<String>(name.value);
     }
@@ -246,6 +286,7 @@ class ItemsCompanion extends UpdateCompanion<Item> {
           ..write('userId: $userId, ')
           ..write('updatedAt: $updatedAt, ')
           ..write('deleted: $deleted, ')
+          ..write('dirty: $dirty, ')
           ..write('name: $name, ')
           ..write('rowid: $rowid')
           ..write(')'))
@@ -273,6 +314,7 @@ typedef $$ItemsTableCreateCompanionBuilder =
       Value<String?> userId,
       required DateTime updatedAt,
       Value<bool> deleted,
+      Value<bool> dirty,
       required String name,
       Value<int> rowid,
     });
@@ -282,6 +324,7 @@ typedef $$ItemsTableUpdateCompanionBuilder =
       Value<String?> userId,
       Value<DateTime> updatedAt,
       Value<bool> deleted,
+      Value<bool> dirty,
       Value<String> name,
       Value<int> rowid,
     });
@@ -311,6 +354,11 @@ class $$ItemsTableFilterComposer extends Composer<_$TestDatabase, $ItemsTable> {
 
   ColumnFilters<bool> get deleted => $composableBuilder(
     column: $table.deleted,
+    builder: (column) => ColumnFilters(column),
+  );
+
+  ColumnFilters<bool> get dirty => $composableBuilder(
+    column: $table.dirty,
     builder: (column) => ColumnFilters(column),
   );
 
@@ -349,6 +397,11 @@ class $$ItemsTableOrderingComposer
     builder: (column) => ColumnOrderings(column),
   );
 
+  ColumnOrderings<bool> get dirty => $composableBuilder(
+    column: $table.dirty,
+    builder: (column) => ColumnOrderings(column),
+  );
+
   ColumnOrderings<String> get name => $composableBuilder(
     column: $table.name,
     builder: (column) => ColumnOrderings(column),
@@ -375,6 +428,9 @@ class $$ItemsTableAnnotationComposer
 
   GeneratedColumn<bool> get deleted =>
       $composableBuilder(column: $table.deleted, builder: (column) => column);
+
+  GeneratedColumn<bool> get dirty =>
+      $composableBuilder(column: $table.dirty, builder: (column) => column);
 
   GeneratedColumn<String> get name =>
       $composableBuilder(column: $table.name, builder: (column) => column);
@@ -412,6 +468,7 @@ class $$ItemsTableTableManager
                 Value<String?> userId = const Value.absent(),
                 Value<DateTime> updatedAt = const Value.absent(),
                 Value<bool> deleted = const Value.absent(),
+                Value<bool> dirty = const Value.absent(),
                 Value<String> name = const Value.absent(),
                 Value<int> rowid = const Value.absent(),
               }) => ItemsCompanion(
@@ -419,6 +476,7 @@ class $$ItemsTableTableManager
                 userId: userId,
                 updatedAt: updatedAt,
                 deleted: deleted,
+                dirty: dirty,
                 name: name,
                 rowid: rowid,
               ),
@@ -428,6 +486,7 @@ class $$ItemsTableTableManager
                 Value<String?> userId = const Value.absent(),
                 required DateTime updatedAt,
                 Value<bool> deleted = const Value.absent(),
+                Value<bool> dirty = const Value.absent(),
                 required String name,
                 Value<int> rowid = const Value.absent(),
               }) => ItemsCompanion.insert(
@@ -435,6 +494,7 @@ class $$ItemsTableTableManager
                 userId: userId,
                 updatedAt: updatedAt,
                 deleted: deleted,
+                dirty: dirty,
                 name: name,
                 rowid: rowid,
               ),

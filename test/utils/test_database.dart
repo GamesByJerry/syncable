@@ -1,4 +1,4 @@
-import 'package:drift/drift.dart';
+import 'package:drift/drift.dart' hide JsonKey;
 import 'package:equatable/equatable.dart';
 import 'package:json_annotation/json_annotation.dart';
 import 'package:syncable/syncable.dart';
@@ -25,6 +25,9 @@ class Items extends Table implements SyncableTable {
   @override
   BoolColumn get deleted => boolean().withDefault(const Constant(false))();
 
+  @override
+  BoolColumn get dirty => boolean().withDefault(const Constant(true))();
+
   TextColumn get name => text().withLength(min: 1, max: 50)();
 
   @override
@@ -39,6 +42,7 @@ class Item extends Equatable implements Syncable {
     required this.updatedAt,
     required this.deleted,
     required this.name,
+    this.dirty = true,
   });
 
   factory Item.fromJson(Map<String, dynamic> json) => _$ItemFromJson(json);
@@ -51,6 +55,11 @@ class Item extends Equatable implements Syncable {
   final DateTime updatedAt;
   @override
   final bool deleted;
+
+  // Local-only push flag — never crosses the wire (backend has no such column).
+  @override
+  @JsonKey(includeFromJson: false, includeToJson: false)
+  final bool dirty;
 
   final String name;
 
@@ -70,6 +79,7 @@ class Item extends Equatable implements Syncable {
           updatedAt: updatedAt,
           userId: Value(userId),
           deleted: Value(deleted),
+          dirty: Value(dirty),
           name: name,
         )
         as UpdateCompanion<Item>;
