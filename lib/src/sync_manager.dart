@@ -716,9 +716,13 @@ class SyncManager<T extends SyncableDatabase> {
         final cleanCompanion =
             _companions[syncable]!(dirty: const Value(false))
                 as UpdateCompanion<S>;
-        await (_localDb.update(
-          table,
-        )..where((tbl) => tbl.id.isIn(writtenIds))).write(cleanCompanion);
+        // Chunk the id list: a single `isIn` over a large initial/backlog sync
+        // can exceed SQLite's variable limit (999) → "too many SQL variables".
+        for (final idChunk in writtenIds.slices(500)) {
+          await (_localDb.update(
+            table,
+          )..where((tbl) => tbl.id.isIn(idChunk))).write(cleanCompanion);
+        }
       }
     });
   }
