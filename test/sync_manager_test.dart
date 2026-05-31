@@ -255,14 +255,14 @@ void main() {
       // Update the item to trigger a sync. A local edit must mark the row
       // dirty=true (the app gets this via Syncable.toCompanion()); without it
       // the dirty-flag engine correctly treats the row as already in sync.
-      await (testDb.update(testDb.items)
-            ..where((i) => i.rowId.equals(itemRowId)))
-          .write(
-            ItemsCompanion(
-              updatedAt: drift.Value(DateTime.now()),
-              dirty: const drift.Value(true),
-            ),
-          );
+      await (testDb.update(
+        testDb.items,
+      )..where((i) => i.rowId.equals(itemRowId))).write(
+        ItemsCompanion(
+          updatedAt: drift.Value(DateTime.now()),
+          dirty: const drift.Value(true),
+        ),
+      );
 
       await waitForFunctionToPass(() async {
         expect(syncManager.nSyncedToBackend(Item), 2);
@@ -502,6 +502,89 @@ void main() {
     await waitForFunctionToPass(() async {
       expect(syncManager.nSyncedToBackend(Item), 1);
     });
+  });
+
+  test('Purge non-UUID-owned rows removes only invalid-owner rows', () async {
+    final syncManager = SyncManager<TestDatabase>(
+      localDatabase: testDb,
+      supabaseClient: mockSupabaseClient,
+      syncInterval: const Duration(milliseconds: 1),
+    );
+
+    syncManager.registerSyncable<Item>(
+      backendTable: itemsTable,
+      fromJson: Item.fromJson,
+      companionConstructor: ItemsCompanion.new,
+    );
+
+    final realUserId = const Uuid().v4();
+    // 36 chars (satisfies the userId length constraint) but not a UUID — the
+    // 'g' characters are non-hex, so it stands in for an offline-guest id.
+    const guestUserId = 'gggggggg-gggg-gggg-gggg-gggggggggggg';
+
+    Future<String> insert(String name, drift.Value<String?> userId) async {
+      final row = await testDb
+          .into(testDb.items)
+          .insertReturning(
+            ItemsCompanion(
+              updatedAt: drift.Value(DateTime.now()),
+              name: drift.Value(name),
+              userId: userId,
+            ),
+          );
+      return row.id;
+    }
+
+    final realId = await insert('real', drift.Value(realUserId));
+    final guestId = await insert('guest', const drift.Value(guestUserId));
+    final orphanId = await insert('orphan', const drift.Value(null));
+
+    final removed = await syncManager.purgeNonUuidOwnedRows();
+
+    expect(removed, 1);
+    final remaining = (await testDb.select(testDb.items).get())
+        .map((r) => r.id)
+        .toSet();
+    // Real (UUID) and null-owner rows survive; only the guest row is purged.
+    expect(remaining, containsAll(<String>[realId, orphanId]));
+    expect(remaining, isNot(contains(guestId)));
+  });
+
+  test('Purge handles more doomed rows than SQLite allows variables', () async {
+    final syncManager = SyncManager<TestDatabase>(
+      localDatabase: testDb,
+      supabaseClient: mockSupabaseClient,
+      syncInterval: const Duration(milliseconds: 1),
+    );
+
+    syncManager.registerSyncable<Item>(
+      backendTable: itemsTable,
+      fromJson: Item.fromJson,
+      companionConstructor: ItemsCompanion.new,
+    );
+
+    const guestUserId = 'gggggggg-gggg-gggg-gggg-gggggggggggg';
+    // More than SQLite's ~999 bound-variable limit, so a single isIn() would
+    // throw 'too many SQL variables'; the chunked delete must not.
+    const doomedCount = 1500;
+    await testDb.batch((batch) {
+      batch.insertAll(
+        testDb.items,
+        List.generate(
+          doomedCount,
+          (i) => ItemsCompanion(
+            updatedAt: drift.Value(DateTime.now()),
+            name: drift.Value('guest_$i'),
+            userId: const drift.Value(guestUserId),
+          ),
+        ),
+      );
+    });
+
+    final removed = await syncManager.purgeNonUuidOwnedRows();
+
+    expect(removed, doomedCount);
+    expect(await testDb.select(testDb.items).get(), isEmpty);
   });
 
   test(

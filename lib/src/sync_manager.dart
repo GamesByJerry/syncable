@@ -300,6 +300,64 @@ class SyncManager<T extends SyncableDatabase> {
     });
   }
 
+  /// Matches a backend-valid (RFC 4122) UUID, the shape Supabase requires for a
+  /// `user_id`. Anything else (e.g. an offline-guest id `offline_guest_<uuid>`)
+  /// can never be accepted by the backend.
+  static final RegExp _uuidPattern = RegExp(
+    '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+    '[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\$',
+  );
+
+  /// Hard-deletes local rows whose [Syncable.userId] is not a backend-valid
+  /// UUID, returning the number of rows removed.
+  ///
+  /// Such rows can never sync: Supabase rejects a non-UUID `user_id` with a
+  /// `22P02` error, which jams the outgoing push queue and stalls all sync. The
+  /// canonical source is offline-guest data (`offline_guest_<uuid>`) left behind
+  /// when a real user later takes over the same install. Because the backend
+  /// never accepted these rows, removing them needs no soft-delete tombstone —
+  /// a hard delete is correct and final.
+  ///
+  /// Rows with a null `userId` are left untouched (use
+  /// [fillMissingUserIdForLocalTables] to adopt those into the current user).
+  /// Call this after a real (UUID) user signs in, before re-enabling sync.
+  Future<int> purgeNonUuidOwnedRows() async {
+    int removed = 0;
+    await _localDb.transaction(() async {
+      for (final syncable in _syncables) {
+        final table = _localTables[syncable]!;
+        // Load only owned rows. Null-owner rows are never purged here — they are
+        // adopted into the current user by [fillMissingUserIdForLocalTables] —
+        // and excluding them in SQL avoids pulling every local row into memory.
+        final rows = await (_localDb.select(
+          table,
+        )..where((row) => row.userId.isNotNull())).get();
+        final doomedIds = rows
+            .where((r) => !_uuidPattern.hasMatch(r.userId!))
+            .map((r) => r.id)
+            .toList();
+        if (doomedIds.isEmpty) continue;
+        // Chunk to stay under SQLite's bound-variable limit (~999), the same
+        // guard _batchWriteIncoming uses for its id-keyed deletes.
+        for (final idChunk in doomedIds.slices(500)) {
+          await (_localDb.delete(
+            table,
+          )..where((row) => row.id.isIn(idChunk))).go();
+        }
+        // Drop any copies already sitting in the out queue so a pending push
+        // can't resend the non-UUID owner and re-jam the queue with 22P02 (the
+        // MC-380 failure mode) even though the local row is now gone.
+        final doomedSet = doomedIds.toSet();
+        _outQueues[syncable]?.removeWhere((id, _) => doomedSet.contains(id));
+        removed += doomedIds.length;
+      }
+    });
+    if (removed > 0) {
+      _logger.info('Purged $removed non-UUID-owned local row(s)');
+    }
+    return removed;
+  }
+
   Future _onDependenciesChanged(String reason) async {
     _maybeSubscribeToLocalChanges();
     _maybeSubscribeToBackendChanges();
