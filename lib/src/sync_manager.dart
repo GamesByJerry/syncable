@@ -300,6 +300,50 @@ class SyncManager<T extends SyncableDatabase> {
     });
   }
 
+  /// Matches a backend-valid (RFC 4122) UUID, the shape Supabase requires for a
+  /// `user_id`. Anything else (e.g. an offline-guest id `offline_guest_<uuid>`)
+  /// can never be accepted by the backend.
+  static final RegExp _uuidPattern = RegExp(
+    '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+    '[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\$',
+  );
+
+  /// Hard-deletes local rows whose [Syncable.userId] is not a backend-valid
+  /// UUID, returning the number of rows removed.
+  ///
+  /// Such rows can never sync: Supabase rejects a non-UUID `user_id` with a
+  /// `22P02` error, which jams the outgoing push queue and stalls all sync. The
+  /// canonical source is offline-guest data (`offline_guest_<uuid>`) left behind
+  /// when a real user later takes over the same install. Because the backend
+  /// never accepted these rows, removing them needs no soft-delete tombstone —
+  /// a hard delete is correct and final.
+  ///
+  /// Rows with a null `userId` are left untouched (use
+  /// [fillMissingUserIdForLocalTables] to adopt those into the current user).
+  /// Call this after a real (UUID) user signs in, before re-enabling sync.
+  Future<int> purgeNonUuidOwnedRows() async {
+    int removed = 0;
+    await _localDb.transaction(() async {
+      for (final syncable in _syncables) {
+        final table = _localTables[syncable]!;
+        final rows = await _localDb.select(table).get();
+        final doomedIds = rows
+            .where((r) => r.userId != null && !_uuidPattern.hasMatch(r.userId!))
+            .map((r) => r.id)
+            .toList();
+        if (doomedIds.isEmpty) continue;
+        await (_localDb.delete(
+          table,
+        )..where((row) => row.id.isIn(doomedIds))).go();
+        removed += doomedIds.length;
+      }
+    });
+    if (removed > 0) {
+      _logger.info('Purged $removed non-UUID-owned local row(s)');
+    }
+    return removed;
+  }
+
   Future _onDependenciesChanged(String reason) async {
     _maybeSubscribeToLocalChanges();
     _maybeSubscribeToBackendChanges();
