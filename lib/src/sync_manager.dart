@@ -326,15 +326,29 @@ class SyncManager<T extends SyncableDatabase> {
     await _localDb.transaction(() async {
       for (final syncable in _syncables) {
         final table = _localTables[syncable]!;
-        final rows = await _localDb.select(table).get();
+        // Load only owned rows. Null-owner rows are never purged here — they are
+        // adopted into the current user by [fillMissingUserIdForLocalTables] —
+        // and excluding them in SQL avoids pulling every local row into memory.
+        final rows = await (_localDb.select(
+          table,
+        )..where((row) => row.userId.isNotNull())).get();
         final doomedIds = rows
-            .where((r) => r.userId != null && !_uuidPattern.hasMatch(r.userId!))
+            .where((r) => !_uuidPattern.hasMatch(r.userId!))
             .map((r) => r.id)
             .toList();
         if (doomedIds.isEmpty) continue;
-        await (_localDb.delete(
-          table,
-        )..where((row) => row.id.isIn(doomedIds))).go();
+        // Chunk to stay under SQLite's bound-variable limit (~999), the same
+        // guard _batchWriteIncoming uses for its id-keyed deletes.
+        for (final idChunk in doomedIds.slices(500)) {
+          await (_localDb.delete(
+            table,
+          )..where((row) => row.id.isIn(idChunk))).go();
+        }
+        // Drop any copies already sitting in the out queue so a pending push
+        // can't resend the non-UUID owner and re-jam the queue with 22P02 (the
+        // MC-380 failure mode) even though the local row is now gone.
+        final doomedSet = doomedIds.toSet();
+        _outQueues[syncable]?.removeWhere((id, _) => doomedSet.contains(id));
         removed += doomedIds.length;
       }
     });

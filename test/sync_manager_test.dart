@@ -550,6 +550,43 @@ void main() {
     expect(remaining, isNot(contains(guestId)));
   });
 
+  test('Purge handles more doomed rows than SQLite allows variables', () async {
+    final syncManager = SyncManager<TestDatabase>(
+      localDatabase: testDb,
+      supabaseClient: mockSupabaseClient,
+      syncInterval: const Duration(milliseconds: 1),
+    );
+
+    syncManager.registerSyncable<Item>(
+      backendTable: itemsTable,
+      fromJson: Item.fromJson,
+      companionConstructor: ItemsCompanion.new,
+    );
+
+    const guestUserId = 'gggggggg-gggg-gggg-gggg-gggggggggggg';
+    // More than SQLite's ~999 bound-variable limit, so a single isIn() would
+    // throw 'too many SQL variables'; the chunked delete must not.
+    const doomedCount = 1500;
+    await testDb.batch((batch) {
+      batch.insertAll(
+        testDb.items,
+        List.generate(
+          doomedCount,
+          (i) => ItemsCompanion(
+            updatedAt: drift.Value(DateTime.now()),
+            name: drift.Value('guest_$i'),
+            userId: const drift.Value(guestUserId),
+          ),
+        ),
+      );
+    });
+
+    final removed = await syncManager.purgeNonUuidOwnedRows();
+
+    expect(removed, doomedCount);
+    expect(await testDb.select(testDb.items).get(), isEmpty);
+  });
+
   test(
     'Trying to fill missing user IDs without first setting a user ID does not crash',
     () async {
