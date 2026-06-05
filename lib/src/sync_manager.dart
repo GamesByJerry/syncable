@@ -49,6 +49,14 @@ class SyncManager<T extends SyncableDatabase> {
   /// in combination with [lastTimeOtherDeviceWasActive] to determine whether
   /// other devices are currently active or not. A real-time subscription to
   /// the backend is only created if other devices are considered active.
+  ///
+  /// The [reconcileOverlap] parameter is the safety window subtracted from the
+  /// last-pull watermark when reconciling from the backend. The reconcile only
+  /// fetches metadata for rows changed since the previous pull (minus this
+  /// overlap), which keeps the sweep cheap; the overlap absorbs clock skew
+  /// between devices and rows written during the previous pull so none are
+  /// missed. Requires a [syncTimestampStorage]; without one every reconcile
+  /// falls back to a full sweep.
   SyncManager({
     required T localDatabase,
     required SupabaseClient supabaseClient,
@@ -56,12 +64,14 @@ class SyncManager<T extends SyncableDatabase> {
     int maxRows = 1000,
     SyncTimestampStorage? syncTimestampStorage,
     Duration otherDevicesConsideredInactiveAfter = const Duration(minutes: 2),
+    Duration reconcileOverlap = const Duration(seconds: 10),
   }) : _localDb = localDatabase,
        _supabaseClient = supabaseClient,
        _syncInterval = syncInterval,
        _maxRows = maxRows,
        _syncTimestampStorage = syncTimestampStorage,
        _devicesConsideredInactiveAfter = otherDevicesConsideredInactiveAfter,
+       _reconcileOverlap = reconcileOverlap,
        assert(
          syncInterval.inMilliseconds > 0,
          'Sync interval must be positive',
@@ -75,6 +85,7 @@ class SyncManager<T extends SyncableDatabase> {
   final Duration _syncInterval;
   final int _maxRows;
   final Duration _devicesConsideredInactiveAfter;
+  final Duration _reconcileOverlap;
 
   /// This is what gets set when [enableSync] gets called. Internally, whether
   /// the syncing is enabled or not is determined by [_syncingEnabled].
@@ -148,6 +159,10 @@ class SyncManager<T extends SyncableDatabase> {
   bool _disposed = false;
   bool _loopRunning = false;
 
+  /// Set while the sync loop is parked in [_idle]. Completed by [_wake] to drain
+  /// immediately instead of waiting for the [_syncInterval] backstop timer.
+  Completer<void>? _wakeSignal;
+
   final _syncables = <Type>[];
   List<Type> get syncables => _syncables;
 
@@ -168,6 +183,10 @@ class SyncManager<T extends SyncableDatabase> {
   RealtimeChannel? _backendSubscription;
   bool get isSubscribedToBackend => _backendSubscription != null;
 
+  /// Debounces rebuilding the backend channel after an unexpected drop so a
+  /// persistently failing socket can't spin in a tight resubscribe loop.
+  Timer? _resubscribeTimer;
+
   /// The number of items of type [syncable] that have been synced to the
   /// backend.
   int nSyncedToBackend(Type syncable) => _nSyncedToBackend[syncable] ??= 0;
@@ -183,6 +202,10 @@ class SyncManager<T extends SyncableDatabase> {
 
   void dispose() {
     _disposed = true;
+    // Unpark the loop so it observes _disposed and exits promptly instead of
+    // lingering until the backstop timer fires.
+    _wake();
+    _resubscribeTimer?.cancel();
     for (final subscription in _localSubscriptions.values) {
       subscription.cancel();
     }
@@ -262,11 +285,43 @@ class SyncManager<T extends SyncableDatabase> {
       }
 
       if (_disposed) break;
-      await Future.delayed(_syncInterval);
+      await _idle();
     }
 
     _loopRunning = false;
     _logger.info('Sync loop stopped');
+  }
+
+  /// Wakes the sync loop if it is currently parked in [_idle]. A no-op when the
+  /// loop is busy (no pending signal): the freshly enqueued work is already in a
+  /// queue, so the loop's next [_idle] queue check drains it without a signal.
+  void _wake() {
+    final signal = _wakeSignal;
+    if (signal != null && !signal.isCompleted) {
+      signal.complete();
+    }
+  }
+
+  /// Parks the loop until there is work to do. Returns immediately if a queue
+  /// already holds items — this closes the missed-wake race where an item is
+  /// enqueued between a drain finishing and the loop parking. Otherwise it waits
+  /// for either a [_wake] signal (sub-second steady-state latency) or the
+  /// [_syncInterval] backstop timer, whichever fires first.
+  Future<void> _idle() async {
+    if (_disposed) return;
+    if (isSyncingToBackend || isSyncingFromBackend) return;
+
+    final signal = _wakeSignal = Completer<void>();
+    final backstop = Timer(_syncInterval, () {
+      if (!signal.isCompleted) signal.complete();
+    });
+
+    try {
+      await signal.future;
+    } finally {
+      backstop.cancel();
+      if (identical(_wakeSignal, signal)) _wakeSignal = null;
+    }
   }
 
   /// Goes through the local tables for all registered syncables and sets the
@@ -407,6 +462,7 @@ class SyncManager<T extends SyncableDatabase> {
         row.updatedAt.isAfter(outQueue[row.id]?.updatedAt ?? DateTime(0)) &&
         row.updatedAt.isAfter(_lastPushedTimestamp(syncable) ?? DateTime(0));
 
+    var enqueuedAny = false;
     for (final row
         in rows
             // Only push rows with unpushed LOCAL changes. A row pulled from the
@@ -418,7 +474,12 @@ class SyncManager<T extends SyncableDatabase> {
             .where((r) => !receivedItems.contains(r))
             .where(updateHasNotBeenSentYet)) {
       outQueue[row.id] = row;
+      enqueuedAny = true;
     }
+
+    // Drain the new work now rather than on the next backstop tick. Reached from
+    // the local-change Drift subscription (writer side) and from _syncTable.
+    if (enqueuedAny) _wake();
   }
 
   void _maybeSubscribeToBackendChanges() {
@@ -451,10 +512,11 @@ class SyncManager<T extends SyncableDatabase> {
       return;
     }
 
-    _backendSubscription = _supabaseClient.channel('backend_changes');
+    final channel = _supabaseClient.channel('backend_changes');
+    _backendSubscription = channel;
 
     for (final syncable in _syncables) {
-      _backendSubscription?.onPostgresChanges(
+      channel.onPostgresChanges(
         schema: publicSchema,
         table: _backendTables[syncable],
         event: PostgresChangeEvent.all,
@@ -463,6 +525,9 @@ class SyncManager<T extends SyncableDatabase> {
           if (p.newRecord.isNotEmpty) {
             final item = _fromJsons[syncable]!(p.newRecord);
             _inQueues[syncable]!.add(item);
+            // Drain the realtime delivery now rather than on the next backstop
+            // tick — this is the reader-side half of the sub-second path.
+            _wake();
           }
         },
         // GAM-389: no user_id filter — Postgres Changes only delivers rows the
@@ -470,15 +535,64 @@ class SyncManager<T extends SyncableDatabase> {
       );
     }
 
-    _backendSubscription?.subscribe((status, error) {
-      if (error != null) {
-        // coverage:ignore-start
-        _logger.severe('Backend subscription error: $error');
-        // coverage:ignore-end
-      }
-    });
+    channel.subscribe(
+      (status, error) => _onBackendSubscriptionStatus(channel, status, error),
+    );
+  }
 
-    _logger.info('Subscribed to backend changes');
+  /// Handles backend channel lifecycle (MC-413 item 6). Every (re)connect forces
+  /// a reconcile to backfill events the channel could not replay while it was
+  /// down; an unexpected drop rebuilds the channel, because a closed realtime
+  /// channel cannot be re-subscribed in place.
+  void _onBackendSubscriptionStatus(
+    RealtimeChannel channel,
+    RealtimeSubscribeStatus status,
+    Object? error,
+  ) {
+    switch (status) {
+      case RealtimeSubscribeStatus.subscribed:
+        _resubscribeTimer?.cancel();
+        _logger.info('Subscribed to backend changes');
+        // Backfill whatever realtime could not deliver while (re)connecting.
+        // Fire-and-forget, but guard so a failed reconcile can't surface as an
+        // unhandled async error from this realtime callback.
+        unawaited(
+          syncTables().catchError((Object e, StackTrace s) {
+            _logger.severe('Backfill on (re)connect failed: $e\n$s');
+          }),
+        );
+      case RealtimeSubscribeStatus.closed:
+      case RealtimeSubscribeStatus.channelError:
+      case RealtimeSubscribeStatus.timedOut:
+        _logger.warning(
+          'Backend subscription dropped ($status)'
+          '${error != null ? ': $error' : ''}',
+        );
+        _handleBackendSubscriptionDrop(channel);
+    }
+  }
+
+  void _handleBackendSubscriptionDrop(RealtimeChannel channel) {
+    // Ignore late callbacks from a channel we already replaced or tore down.
+    if (!identical(channel, _backendSubscription)) return;
+    _backendSubscription = null;
+    // Kill the dead channel's postgres callbacks and its own rejoin attempts so
+    // we never end up with two live channels delivering duplicate events.
+    channel.unsubscribe();
+    if (_disposed) return;
+    // Rebuild on a backstop-paced debounce. _maybeSubscribeToBackendChanges
+    // re-checks the want-conditions, so an intentional teardown (sync disabled /
+    // no active devices) simply won't resubscribe.
+    _scheduleBackendResubscribe();
+  }
+
+  void _scheduleBackendResubscribe() {
+    if (_disposed) return;
+    if (_resubscribeTimer?.isActive ?? false) return;
+    _resubscribeTimer = Timer(_syncInterval, () {
+      if (_disposed) return;
+      _maybeSubscribeToBackendChanges();
+    });
   }
 
   /// Syncs all tables registered with the sync manager.
@@ -537,6 +651,10 @@ class SyncManager<T extends SyncableDatabase> {
     final localItemsUpdatedAt = {for (final i in localItems) i.id: i.updatedAt};
 
     assert(_userId.isNotEmpty);
+    // Capture the watermark BEFORE fetching: any row written while this pull is
+    // in flight has updatedAt >= pullStartedAt, so the next reconcile's
+    // `> pullStartedAt - overlap` filter still catches it.
+    final pullStartedAt = DateTime.now().toUtc();
     final backendItems = await _fetchBackendItemMetadata(syncable);
 
     final itemsToPull = _getItemsToPullFromBackend(
@@ -561,9 +679,11 @@ class SyncManager<T extends SyncableDatabase> {
           .then((data) => data.map(_fromJsons[syncable]!));
 
       _inQueues[syncable]!.addAll(pulledBatch);
+      // A reconcile (off-loop) found rows to pull — wake the loop to write them.
+      _wake();
     }
 
-    _updateLastPulledTimeStamp(syncable, DateTime.now().toUtc());
+    await _updateLastPulledTimeStamp(syncable, pullStartedAt);
   }
 
   bool _skipSyncFromBackend(Type syncable) {
@@ -590,14 +710,27 @@ class SyncManager<T extends SyncableDatabase> {
   ) async {
     final List<Map<String, dynamic>> backendItems = [];
 
+    // MC-413 item 4: incremental sweep. Once we have a watermark from a previous
+    // pull, only ask the backend for rows changed since then (minus the overlap
+    // window), turning an O(all rows) sweep into O(rows changed since last
+    // pull). A null watermark — first pull, or no timestamp storage — falls back
+    // to a full sweep so the initial reconcile never misses anything.
+    final lastPulled = _lastPulledTimestamp(syncable);
+    final changedSince = lastPulled?.subtract(_reconcileOverlap);
+
     int offset = 0;
     bool hasMore = true;
 
     while (hasMore && _syncingEnabled) {
-      final batch = await _supabaseClient
+      var query = _supabaseClient
           .from(_backendTables[syncable]!)
-          .select('$idKey,$updatedAtKey')
-          // GAM-389: no user_id filter — metadata for all RLS-visible rows.
+          .select('$idKey,$updatedAtKey');
+      // GAM-389: no user_id filter — metadata for all RLS-visible rows.
+      if (changedSince != null) {
+        query = query.gt(updatedAtKey, changedSince.toIso8601String());
+      }
+
+      final batch = await query
           .range(offset, offset + _maxRows - 1)
           // Use consistent ordering to prevent duplicates
           .order(idKey, ascending: true);
@@ -811,9 +944,9 @@ class SyncManager<T extends SyncableDatabase> {
     Type syncable,
     DateTime timestamp,
   ) async {
-    _syncTimestampStorage?.setSyncTimestamp(
+    await _syncTimestampStorage?.setSyncTimestamp(
       _keyForPersistentStorage(TimestampType.lastSyncFromBackend, syncable),
-      DateTime.now().toUtc(),
+      timestamp,
     );
   }
 

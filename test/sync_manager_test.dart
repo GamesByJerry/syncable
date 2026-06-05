@@ -35,6 +35,7 @@ void main() {
   late MockSupabaseClient mockSupabaseClient;
   late MockSupabaseQueryBuilder mockQueryBuilder;
   late MockClient mockHttpClient;
+  late MockRealtimeChannel mockRealtimeChannel;
 
   setUp(() {
     testDb = TestDatabase(
@@ -89,7 +90,7 @@ void main() {
     );
 
     // Set up mocks for Supabase to allow listening to changes in the database
-    final mockRealtimeChannel = MockRealtimeChannel();
+    mockRealtimeChannel = MockRealtimeChannel();
     when(mockSupabaseClient.channel(any)).thenReturn(mockRealtimeChannel);
     when(
       mockRealtimeChannel.onPostgresChanges(
@@ -100,7 +101,7 @@ void main() {
       ),
     ).thenReturn(mockRealtimeChannel);
     when(
-      mockRealtimeChannel.subscribe(),
+      mockRealtimeChannel.subscribe(any),
     ).thenAnswer((_) => mockRealtimeChannel);
   });
 
@@ -684,5 +685,339 @@ void main() {
     );
 
     expect(syncManager.syncables, equals([Item]));
+  });
+
+  // MC-413 item 1: event-driven queue draining. The loop must drain on a wake
+  // signal from the two enqueue sites, not only on its backstop timer. A long
+  // `syncInterval` makes the distinction observable: if the loop still relied on
+  // the timer, these would not finish until 10s; the wake must drain in ~ms.
+  group('Event-driven wake (long sync interval)', () {
+    test('A local change wakes the loop and pushes well under the interval', () async {
+      final syncManager = SyncManager(
+        localDatabase: testDb,
+        supabaseClient: mockSupabaseClient,
+        syncInterval: const Duration(seconds: 10),
+      );
+      syncManager.registerSyncable<Item>(
+        backendTable: itemsTable,
+        fromJson: Item.fromJson,
+        companionConstructor: ItemsCompanion.new,
+      );
+      final userId = const Uuid().v4();
+      syncManager.enableSync();
+      syncManager.setUserId(userId);
+
+      await testDb.into(testDb.items).insert(
+            ItemsCompanion(
+              userId: drift.Value(userId),
+              updatedAt: drift.Value(DateTime.now()),
+              deleted: const drift.Value(false),
+              name: const drift.Value('woken'),
+            ),
+          );
+
+      await waitForFunctionToPass(
+        () async => expect(syncManager.nSyncedToBackend(Item), 1),
+        timeout: const Duration(seconds: 2),
+      );
+
+      syncManager.dispose();
+    });
+
+    test('A realtime event wakes the loop and writes locally under the interval', () async {
+      void Function(PostgresChangePayload)? pgCallback;
+      when(
+        mockRealtimeChannel.onPostgresChanges(
+          schema: anyNamed('schema'),
+          table: anyNamed('table'),
+          event: anyNamed('event'),
+          callback: anyNamed('callback'),
+        ),
+      ).thenAnswer((inv) {
+        pgCallback =
+            inv.namedArguments[#callback] as void Function(PostgresChangePayload)?;
+        return mockRealtimeChannel;
+      });
+
+      final syncManager = SyncManager(
+        localDatabase: testDb,
+        supabaseClient: mockSupabaseClient,
+        syncInterval: const Duration(seconds: 10),
+      );
+      syncManager.registerSyncable<Item>(
+        backendTable: itemsTable,
+        fromJson: Item.fromJson,
+        companionConstructor: ItemsCompanion.new,
+      );
+      final userId = const Uuid().v4();
+      syncManager.setUserId(userId);
+      syncManager.enableSync();
+
+      // The backend subscription is created once dependencies settle; that is
+      // where our realtime callback gets registered.
+      await waitForFunctionToPass(() async => expect(pgCallback, isNotNull));
+
+      final incoming = Item(
+        id: const Uuid().v4(),
+        userId: userId,
+        updatedAt: DateTime.now(),
+        deleted: false,
+        name: 'from-realtime',
+      );
+      pgCallback!(
+        PostgresChangePayload(
+          schema: 'public',
+          table: itemsTable,
+          commitTimestamp: DateTime.now(),
+          eventType: PostgresChangeEvent.insert,
+          newRecord: incoming.toJson(),
+          oldRecord: const {},
+          errors: null,
+        ),
+      );
+
+      await waitForFunctionToPass(
+        () async {
+          final row = await (testDb.select(
+            testDb.items,
+          )..where((t) => t.id.equals(incoming.id))).getSingleOrNull();
+          expect(row?.name, 'from-realtime');
+        },
+        timeout: const Duration(seconds: 2),
+      );
+
+      syncManager.dispose();
+    });
+
+    test('Rapid successive local changes all push (no missed wakes)', () async {
+      final syncManager = SyncManager(
+        localDatabase: testDb,
+        supabaseClient: mockSupabaseClient,
+        syncInterval: const Duration(seconds: 10),
+      );
+      syncManager.registerSyncable<Item>(
+        backendTable: itemsTable,
+        fromJson: Item.fromJson,
+        companionConstructor: ItemsCompanion.new,
+      );
+      final userId = const Uuid().v4();
+      syncManager.enableSync();
+      syncManager.setUserId(userId);
+
+      // Insert many rows back-to-back, yielding between each so some land right
+      // as a drain finishes — the window where a naive wake-signal would be
+      // missed. The `_idle` queue re-check must still drain every one.
+      const count = 25;
+      for (var i = 0; i < count; i++) {
+        await testDb.into(testDb.items).insert(
+              ItemsCompanion(
+                userId: drift.Value(userId),
+                updatedAt: drift.Value(DateTime.now()),
+                deleted: const drift.Value(false),
+                name: drift.Value('row_$i'),
+              ),
+            );
+        await Future<void>.delayed(Duration.zero);
+      }
+
+      await waitForFunctionToPass(
+        () async => expect(syncManager.nSyncedToBackend(Item), count),
+        timeout: const Duration(seconds: 3),
+      );
+
+      syncManager.dispose();
+    });
+  });
+
+  // MC-413 item 4: incremental metadata fetch. The reconcile's id/updated_at
+  // sweep must be bounded to rows changed since the last pull, not the whole
+  // table — except the first pull (null watermark), which stays a full sweep.
+  group('Incremental metadata fetch', () {
+    List<Uri> metadataGetUris() {
+      final captured = verify(
+        mockHttpClient.get(captureAny, headers: anyNamed('headers')),
+      ).captured.cast<Uri>();
+      // The metadata sweep is the only query selecting `id,updated_at`.
+      return captured
+          .where((u) => u.query.contains('select=id'))
+          .toList();
+    }
+
+    test('First sweep is full; later sweeps filter on updated_at', () async {
+      final syncManager = SyncManager<TestDatabase>(
+        localDatabase: testDb,
+        supabaseClient: mockSupabaseClient,
+        syncInterval: const Duration(milliseconds: 1),
+        syncTimestampStorage: TimestampStorage(),
+      );
+      syncManager.registerSyncable<Item>(
+        backendTable: itemsTable,
+        fromJson: Item.fromJson,
+        companionConstructor: ItemsCompanion.new,
+      );
+
+      syncManager.setUserId(const Uuid().v4());
+      syncManager.enableSync();
+
+      // Force reconciles explicitly: the package loop only drains queues; full
+      // syncs come from dependency changes / explicit calls (the heartbeat that
+      // would drive them periodically lives in the app, not the package).
+      await syncManager.syncTables();
+      await syncManager.syncTables();
+      syncManager.dispose();
+
+      final metaUris = metadataGetUris();
+      expect(metaUris.length, greaterThanOrEqualTo(2));
+      // First pull: no stored watermark yet → unfiltered full sweep.
+      expect(metaUris.first.query, isNot(contains('updated_at=gt')));
+      // A later pull, once a watermark exists, is bounded by updated_at.
+      expect(
+        metaUris.any((u) => u.query.contains('updated_at=gt.')),
+        isTrue,
+        reason: 'expected an incremental sweep filtered on updated_at',
+      );
+    });
+
+    test('Without a timestamp store every sweep stays a full sweep', () async {
+      // No syncTimestampStorage → no watermark can be persisted → the filter can
+      // never be applied, so behaviour must fall back to full sweeps.
+      final syncManager = SyncManager<TestDatabase>(
+        localDatabase: testDb,
+        supabaseClient: mockSupabaseClient,
+        syncInterval: const Duration(milliseconds: 1),
+      );
+      syncManager.registerSyncable<Item>(
+        backendTable: itemsTable,
+        fromJson: Item.fromJson,
+        companionConstructor: ItemsCompanion.new,
+      );
+
+      syncManager.setUserId(const Uuid().v4());
+      syncManager.enableSync();
+
+      await syncManager.syncTables();
+      await syncManager.syncTables();
+      syncManager.dispose();
+
+      final metaUris = metadataGetUris();
+      expect(metaUris.length, greaterThanOrEqualTo(2));
+      expect(
+        metaUris.every((u) => !u.query.contains('updated_at=gt')),
+        isTrue,
+      );
+    });
+  });
+
+  // MC-413 item 6: realtime reconnect robustness. A dropped channel must be
+  // resubscribed (a closed channel cannot be re-subscribed in place), and every
+  // (re)connect must force a reconcile to backfill events realtime missed while
+  // disconnected.
+  group('Realtime reconnect', () {
+    SyncManager<TestDatabase> buildManager({
+      Duration inactiveAfter = const Duration(minutes: 2),
+    }) {
+      final syncManager = SyncManager<TestDatabase>(
+        localDatabase: testDb,
+        supabaseClient: mockSupabaseClient,
+        syncInterval: const Duration(milliseconds: 1),
+        otherDevicesConsideredInactiveAfter: inactiveAfter,
+      );
+      syncManager.registerSyncable<Item>(
+        backendTable: itemsTable,
+        fromJson: Item.fromJson,
+        companionConstructor: ItemsCompanion.new,
+      );
+      return syncManager;
+    }
+
+    test('A (re)connect forces a reconcile to backfill missed events', () async {
+      void Function(RealtimeSubscribeStatus, Object?)? statusCb;
+      when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
+        statusCb = inv.positionalArguments.first
+            as void Function(RealtimeSubscribeStatus, Object?)?;
+        return mockRealtimeChannel;
+      });
+
+      final syncManager = buildManager();
+      syncManager.setUserId(const Uuid().v4());
+      syncManager.enableSync();
+
+      await waitForFunctionToPass(() async => expect(statusCb, isNotNull));
+
+      // Quiesce: wait until the connect-time reconciles stop firing so the delta
+      // we measure is attributable to the status callback, not a pending sync.
+      var before = 0;
+      await waitForFunctionToPass(() async {
+        final count = syncManager.nFullSyncs;
+        await Future<void>.delayed(const Duration(milliseconds: 30));
+        expect(syncManager.nFullSyncs, count);
+        before = count;
+      });
+
+      statusCb!(RealtimeSubscribeStatus.subscribed, null);
+
+      await waitForFunctionToPass(
+        () async => expect(syncManager.nFullSyncs, greaterThan(before)),
+      );
+      syncManager.dispose();
+    });
+
+    test('A dropped channel is resubscribed', () async {
+      var subscribeCount = 0;
+      void Function(RealtimeSubscribeStatus, Object?)? statusCb;
+      when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
+        subscribeCount++;
+        statusCb = inv.positionalArguments.first
+            as void Function(RealtimeSubscribeStatus, Object?)?;
+        return mockRealtimeChannel;
+      });
+
+      final syncManager = buildManager();
+      syncManager.setUserId(const Uuid().v4());
+      syncManager.enableSync();
+
+      await waitForFunctionToPass(() async => expect(subscribeCount, 1));
+
+      // Simulate the socket dropping under us.
+      statusCb!(RealtimeSubscribeStatus.channelError, Exception('boom'));
+
+      // A fresh channel must be built and subscribed.
+      await waitForFunctionToPass(
+        () async => expect(subscribeCount, greaterThanOrEqualTo(2)),
+      );
+      syncManager.dispose();
+    });
+
+    test('A drop is ignored once we no longer want a subscription', () async {
+      var subscribeCount = 0;
+      void Function(RealtimeSubscribeStatus, Object?)? statusCb;
+      when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
+        subscribeCount++;
+        statusCb = inv.positionalArguments.first
+            as void Function(RealtimeSubscribeStatus, Object?)?;
+        return mockRealtimeChannel;
+      });
+
+      final syncManager = buildManager(inactiveAfter: const Duration(seconds: 1));
+      syncManager.setUserId(const Uuid().v4());
+      syncManager.enableSync();
+      await waitForFunctionToPass(() async => expect(subscribeCount, 1));
+
+      // Other devices go inactive → the manager intentionally drops the channel.
+      syncManager.setLastTimeOtherDeviceWasActive(
+        DateTime.now().subtract(const Duration(seconds: 2)).toUtc(),
+      );
+      await waitForFunctionToPass(
+        () async => expect(syncManager.isSubscribedToBackend, isFalse),
+      );
+
+      final countAfterTeardown = subscribeCount;
+      // A late drop callback from the torn-down channel must not resubscribe.
+      statusCb!(RealtimeSubscribeStatus.closed, null);
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      expect(subscribeCount, countAfterTeardown);
+
+      syncManager.dispose();
+    });
   });
 }
