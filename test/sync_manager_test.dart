@@ -29,6 +29,14 @@ class TimestampStorage extends SyncTimestampStorage {
   }
 }
 
+/// Hands back watermarks as *local* (non-UTC) DateTimes — a plausible custom
+/// storage (e.g. one that parses without forcing UTC). Used to prove the
+/// incremental metadata filter still serializes as UTC.
+class LocalReturningTimestampStorage extends TimestampStorage {
+  @override
+  DateTime? getSyncTimestamp(String key) => super.getSyncTimestamp(key)?.toLocal();
+}
+
 void main() {
   late TestDatabase testDb;
 
@@ -876,6 +884,43 @@ void main() {
         isTrue,
         reason: 'expected an incremental sweep filtered on updated_at',
       );
+    });
+
+    test('Incremental filter is serialized as UTC even if storage is local', () async {
+      // Guards the toUtc() on the watermark: a local DateTime would otherwise
+      // serialize without the 'Z' the backend needs (silent tz mismatch).
+      final syncManager = SyncManager<TestDatabase>(
+        localDatabase: testDb,
+        supabaseClient: mockSupabaseClient,
+        syncInterval: const Duration(milliseconds: 1),
+        syncTimestampStorage: LocalReturningTimestampStorage(),
+      );
+      syncManager.registerSyncable<Item>(
+        backendTable: itemsTable,
+        fromJson: Item.fromJson,
+        companionConstructor: ItemsCompanion.new,
+      );
+
+      syncManager.setUserId(const Uuid().v4());
+      syncManager.enableSync();
+      await syncManager.syncTables();
+      await syncManager.syncTables();
+      syncManager.dispose();
+
+      final gtUris = metadataGetUris()
+          .where((u) => u.query.contains('updated_at=gt.'))
+          .toList();
+      expect(gtUris, isNotEmpty);
+      for (final u in gtUris) {
+        final raw = Uri.decodeComponent(
+          u.query.split('updated_at=gt.')[1].split('&').first,
+        );
+        expect(
+          raw.endsWith('Z'),
+          isTrue,
+          reason: 'incremental filter not UTC-serialized: $raw',
+        );
+      }
     });
 
     test('Without a timestamp store every sweep stays a full sweep', () async {
