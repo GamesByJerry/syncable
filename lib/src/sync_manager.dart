@@ -715,7 +715,11 @@ class SyncManager<T extends SyncableDatabase> {
     // window), turning an O(all rows) sweep into O(rows changed since last
     // pull). A null watermark — first pull, or no timestamp storage — falls back
     // to a full sweep so the initial reconcile never misses anything.
-    final lastPulled = _lastPulledTimestamp(syncable);
+    // Force UTC: the watermark comes from a pluggable SyncTimestampStorage that
+    // may hand back a local DateTime, and toIso8601String() on a local time
+    // omits the 'Z' the backend needs — a silent timezone mismatch in the
+    // server-side `updated_at >` filter.
+    final lastPulled = _lastPulledTimestamp(syncable)?.toUtc();
     final changedSince = lastPulled?.subtract(_reconcileOverlap);
 
     int offset = 0;
