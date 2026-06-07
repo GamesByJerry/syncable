@@ -164,6 +164,100 @@ void main() {
   });
 
   test(
+    'a backend-rejected poison row is isolated; the rest still flush '
+    'and the poison row is preserved (per-row fallback)',
+    () async {
+      const poisonId = 'poison-row-id';
+
+      // Reject any upsert whose body contains the poison row (simulates a
+      // constraint / RLS violation that previously wedged the whole batch).
+      when(
+        mockHttpClient.post(
+          any,
+          headers: anyNamed('headers'),
+          body: anyNamed('body'),
+        ),
+      ).thenAnswer((inv) async {
+        final body = inv.namedArguments[#body] as String;
+        final rows = (jsonDecode(body) as List).cast<Map<String, dynamic>>();
+        if (rows.any((r) => r[idKey] == poisonId)) {
+          return Response(
+            jsonEncode({
+              'code': '23505',
+              'message': 'duplicate key value violates unique constraint',
+              'details': null,
+              'hint': null,
+            }),
+            409,
+            request: Request('POST', Uri()),
+            headers: {'content-type': 'application/json; charset=utf-8'},
+          );
+        }
+        return Response(
+          jsonEncode(rows),
+          200,
+          request: Request('POST', Uri()),
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        );
+      });
+
+      final syncManager = SyncManager<TestDatabase>(
+        localDatabase: testDb,
+        supabaseClient: mockSupabaseClient,
+        syncInterval: const Duration(milliseconds: 1),
+      );
+      syncManager.registerSyncable<Item>(
+        backendTable: itemsTable,
+        fromJson: Item.fromJson,
+        companionConstructor: ItemsCompanion.new,
+      );
+
+      final userId = const Uuid().v4();
+      syncManager.enableSync();
+      syncManager.setUserId(userId);
+
+      // A poison row (always rejected) and a healthy row queued together.
+      await testDb.into(testDb.items).insert(
+        ItemsCompanion(
+          id: const drift.Value(poisonId),
+          userId: drift.Value(userId),
+          updatedAt: drift.Value(DateTime.now()),
+          deleted: const drift.Value(false),
+          name: const drift.Value('Poison'),
+        ),
+      );
+      final goodId = const Uuid().v4();
+      await testDb.into(testDb.items).insert(
+        ItemsCompanion(
+          id: drift.Value(goodId),
+          userId: drift.Value(userId),
+          updatedAt: drift.Value(DateTime.now()),
+          deleted: const drift.Value(false),
+          name: const drift.Value('Good'),
+        ),
+      );
+
+      // The healthy row flushes (dirty cleared) despite the poison row sharing
+      // the table — no permanent wedge.
+      await waitForFunctionToPass(() async {
+        final good = await (testDb.select(
+          testDb.items,
+        )..where((t) => t.id.equals(goodId))).getSingle();
+        expect(good.dirty, isFalse, reason: 'healthy row flushed past poison');
+      });
+
+      // The poison row is preserved locally with dirty=true — quarantined, not
+      // lost. (This is the unsynced-data-safety guarantee.)
+      final poison = await (testDb.select(
+        testDb.items,
+      )..where((t) => t.id.equals(poisonId))).getSingle();
+      expect(poison.dirty, isTrue, reason: 'poison row kept, not dropped');
+
+      syncManager.dispose();
+    },
+  );
+
+  test(
     'Only subscribes to backend changes if other devices are active',
     () async {
       final syncManager = SyncManager<TestDatabase>(
