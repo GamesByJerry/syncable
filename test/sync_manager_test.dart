@@ -452,6 +452,107 @@ void main() {
   );
 
   test(
+    'a quarantined row is retried once its version moves on — the quarantine '
+    'is versioned, not permanent',
+    () async {
+      const id = 'versioned-quarantine-id';
+      var poisonRejections = 0;
+
+      // The backend rejects the row while its name is still 'Poison'; it accepts
+      // once the row has been edited (the fix). The id-only quarantine would keep
+      // skipping it forever; the versioned quarantine lets the newer edit retry.
+      when(
+        mockHttpClient.post(
+          any,
+          headers: anyNamed('headers'),
+          body: anyNamed('body'),
+        ),
+      ).thenAnswer((inv) async {
+        final body = inv.namedArguments[#body] as String;
+        final rows = (jsonDecode(body) as List).cast<Map<String, dynamic>>();
+        final poisoned = rows.any(
+          (r) => r[idKey] == id && (r['name'] as String?) == 'Poison',
+        );
+        if (poisoned) {
+          poisonRejections++;
+          return Response(
+            jsonEncode({
+              'code': '23505',
+              'message': 'duplicate key value violates unique constraint',
+              'details': null,
+              'hint': null,
+            }),
+            409,
+            request: Request('POST', Uri()),
+            headers: {'content-type': 'application/json; charset=utf-8'},
+          );
+        }
+        return Response(
+          jsonEncode(rows),
+          200,
+          request: Request('POST', Uri()),
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        );
+      });
+
+      final syncManager = SyncManager<TestDatabase>(
+        localDatabase: testDb,
+        supabaseClient: mockSupabaseClient,
+        syncInterval: const Duration(milliseconds: 1),
+      );
+      syncManager.registerSyncable<Item>(
+        backendTable: itemsTable,
+        fromJson: Item.fromJson,
+        companionConstructor: ItemsCompanion.new,
+      );
+      final userId = const Uuid().v4();
+      syncManager.enableSync();
+      syncManager.setUserId(userId);
+
+      // v1: poison — the push is rejected and the row is quarantined at v1.
+      await testDb.into(testDb.items).insert(
+        ItemsCompanion(
+          id: const drift.Value(id),
+          userId: drift.Value(userId),
+          updatedAt: drift.Value(DateTime.now()),
+          deleted: const drift.Value(false),
+          name: const drift.Value('Poison'),
+        ),
+      );
+
+      // Ensure the poison push was attempted (and thus quarantined) first.
+      await waitForFunctionToPass(() async {
+        expect(poisonRejections, greaterThanOrEqualTo(1));
+      });
+
+      // A local edit (newer updatedAt) that fixes the row. The versioned
+      // quarantine must let this strictly-newer version retry and flush.
+      await (testDb.update(
+        testDb.items,
+      )..where((t) => t.id.equals(id))).write(
+        ItemsCompanion(
+          name: const drift.Value('Fixed'),
+          updatedAt: drift.Value(DateTime.now().add(const Duration(seconds: 1))),
+          dirty: const drift.Value(true),
+        ),
+      );
+
+      await waitForFunctionToPass(() async {
+        final row = await (testDb.select(
+          testDb.items,
+        )..where((t) => t.id.equals(id))).getSingle();
+        expect(
+          row.dirty,
+          isFalse,
+          reason: 'the edited (newer) row retried past quarantine and flushed',
+        );
+      });
+
+      syncManager.dispose();
+    },
+  );
+
+  test(
     'Only subscribes to backend changes if other devices are active',
     () async {
       final syncManager = SyncManager<TestDatabase>(

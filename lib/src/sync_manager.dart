@@ -192,8 +192,15 @@ class SyncManager<T extends SyncableDatabase> {
   /// another device can land and supersede the stale local copy. Sharing one set
   /// would let an outbound-poison id suppress its own valid inbound update until
   /// restart.
-  final Map<Type, Set<String>> _outgoingQuarantined = {};
-  final Map<Type, Set<String>> _incomingQuarantined = {};
+  ///
+  /// Each map is keyed id -> the `updatedAt` of the version that failed. A row is
+  /// only skipped while the pending version is NOT newer than the quarantined
+  /// one; a strictly-newer version (a local edit that may fix a push, or a
+  /// remote fix/tombstone on pull) is let through to retry, and re-quarantined at
+  /// its own version if it fails again. This stops a once-poison row from being
+  /// stuck until restart when the underlying conflict is resolved.
+  final Map<Type, Map<String, DateTime>> _outgoingQuarantined = {};
+  final Map<Type, Map<String, DateTime>> _incomingQuarantined = {};
 
   final Map<Type, StreamSubscription<List<Syncable>>> _localSubscriptions = {};
 
@@ -815,9 +822,14 @@ class SyncManager<T extends SyncableDatabase> {
       // write and onConflict:id makes it an idempotent upsert.
       //
       // Skip rows the backend has permanently rejected (quarantined): a single
-      // poison row must never re-wedge the whole table (MC-424 §B).
+      // poison row must never re-wedge the whole table (MC-424 §B). A row whose
+      // version moved on since it was quarantined (a local edit that may fix the
+      // rejection) is let through to retry.
       final outgoing = outQueue.values
-          .where((s) => !quarantined.contains(s.id))
+          .where((s) {
+            final failedAt = quarantined[s.id];
+            return failedAt == null || s.updatedAt.isAfter(failedAt);
+          })
           .toSet();
       outQueue.clear();
 
@@ -870,11 +882,11 @@ class SyncManager<T extends SyncableDatabase> {
               // retry; do NOT quarantine over a passing backend failure.
               retry.add(row);
             } else {
-              // Permanent rejection of this specific row. Quarantine + report;
-              // the row stays in the local db with dirty=true, so NOTHING is
-              // lost — it simply stops jamming the queue and retries on next
-              // restart.
-              quarantined.add(row.id);
+              // Permanent rejection of this specific row. Quarantine at this
+              // version + report; the row stays in the local db with dirty=true,
+              // so NOTHING is lost — it stops jamming the queue, and a later edit
+              // (newer updatedAt) or a restart gives it another chance.
+              quarantined[row.id] = row.updatedAt;
               _logger.severe(
                 'Quarantined poison row ${row.id} in $backendTable after '
                 'backend rejection: $rowError\n$rowStack',
@@ -971,10 +983,13 @@ class SyncManager<T extends SyncableDatabase> {
       // permanently rejected locally (e.g. it collides with a divergent local
       // row) — quarantined so it can't re-wedge the whole incoming batch every
       // pull (MC-424 §B). This is the INCOMING quarantine only; a row we failed
-      // to push is deliberately still pullable.
+      // to push is deliberately still pullable. The quarantine is versioned: a
+      // strictly-newer backend version (a remote fix / tombstone) is let through
+      // to retry rather than dropped until restart.
+      final failedAt = quarantined[item.id];
       if (sentItems.contains(item) ||
           receivedItems.contains(item) ||
-          quarantined.contains(item.id)) {
+          (failedAt != null && !item.updatedAt.isAfter(failedAt))) {
         continue;
       }
       itemsToWrite[item.id] = item;
@@ -1037,7 +1052,9 @@ class SyncManager<T extends SyncableDatabase> {
         try {
           await _writeIncomingRows(syncable, table, [write]);
         } catch (rowError, rowStack) {
-          quarantined.add(write.id);
+          // Quarantine at this row's version, so a strictly-newer backend
+          // version later supersedes it instead of being dropped until restart.
+          quarantined[write.id] = incomingItems[write.id]!.updatedAt;
           _logger.severe(
             'Quarantined poison incoming row ${write.id} in '
             '${_backendTables[syncable]}: $rowError\n$rowStack',
