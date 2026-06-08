@@ -258,6 +258,95 @@ void main() {
   );
 
   test(
+    'a transient backend failure (5xx/429) is retried, never quarantined',
+    () async {
+      // The backend fails the push transiently (503) on its first attempts, then
+      // recovers. A transient failure must NOT quarantine the row — that would
+      // suppress it until app restart over a passing hiccup. It must keep being
+      // retried and flush once the backend is healthy again (MC-424 §B/§C).
+      // PostgREST reports rate limits / server errors with the HTTP status in
+      // `code`, NOT a Postgres SQLSTATE — that is what marks it transient.
+      var attempts = 0;
+      when(
+        mockHttpClient.post(
+          any,
+          headers: anyNamed('headers'),
+          body: anyNamed('body'),
+        ),
+      ).thenAnswer((inv) async {
+        final body = inv.namedArguments[#body] as String;
+        final rows = (jsonDecode(body) as List).cast<Map<String, dynamic>>();
+        attempts++;
+        if (attempts <= 2) {
+          return Response(
+            jsonEncode({
+              'code': '503',
+              'message': 'service temporarily unavailable',
+              'details': null,
+              'hint': null,
+            }),
+            503,
+            request: Request('POST', Uri()),
+            headers: {'content-type': 'application/json; charset=utf-8'},
+          );
+        }
+        return Response(
+          jsonEncode(rows),
+          200,
+          request: Request('POST', Uri()),
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        );
+      });
+
+      final syncManager = SyncManager<TestDatabase>(
+        localDatabase: testDb,
+        supabaseClient: mockSupabaseClient,
+        syncInterval: const Duration(milliseconds: 1),
+      );
+      syncManager.registerSyncable<Item>(
+        backendTable: itemsTable,
+        fromJson: Item.fromJson,
+        companionConstructor: ItemsCompanion.new,
+      );
+
+      final userId = const Uuid().v4();
+      syncManager.enableSync();
+      syncManager.setUserId(userId);
+
+      final id = const Uuid().v4();
+      await testDb.into(testDb.items).insert(
+        ItemsCompanion(
+          id: drift.Value(id),
+          userId: drift.Value(userId),
+          updatedAt: drift.Value(DateTime.now()),
+          deleted: const drift.Value(false),
+          name: const drift.Value('Flaky'),
+        ),
+      );
+
+      // It eventually flushes once the backend recovers — proving it was retried
+      // past the 503s, not quarantined after the first failure.
+      await waitForFunctionToPass(() async {
+        final row = await (testDb.select(
+          testDb.items,
+        )..where((t) => t.id.equals(id))).getSingle();
+        expect(
+          row.dirty,
+          isFalse,
+          reason: 'transient row recovered and flushed',
+        );
+      });
+      expect(
+        attempts,
+        greaterThan(2),
+        reason: 'row was retried past the transient 503s',
+      );
+
+      syncManager.dispose();
+    },
+  );
+
+  test(
     'Only subscribes to backend changes if other devices are active',
     () async {
       final syncManager = SyncManager<TestDatabase>(

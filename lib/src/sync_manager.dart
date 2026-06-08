@@ -783,6 +783,20 @@ class SyncManager<T extends SyncableDatabase> {
         .map((backendItem) => backendItem[idKey]! as String);
   }
 
+  /// PostgREST surfaces transport-level failures — rate limits (429) and server
+  /// errors (5xx) — as [PostgrestException]s with the HTTP status in [code], the
+  /// same field that otherwise carries a Postgres SQLSTATE (e.g. '23505',
+  /// '42501'). Those SQLSTATEs are PERMANENT for the row (constraint / RLS /
+  /// check) and must be quarantined; 429 / 5xx are TRANSIENT and must be retried.
+  ///
+  /// We parse [code] as an int and treat it as transient only for a real HTTP
+  /// status (429, or 5xx below 600). The `< 600` guard stops a 5-digit SQLSTATE
+  /// like 23505 from being misread as ">= 500".
+  static bool _isTransientPostgrest(PostgrestException e) {
+    final status = int.tryParse(e.code ?? '');
+    return status != null && (status == 429 || (status >= 500 && status < 600));
+  }
+
   Future<void> _processOutgoing(Type syncable) async {
     final outQueue = _outQueues[syncable]!;
     final backendTable = _backendTables[syncable]!;
@@ -811,11 +825,26 @@ class SyncManager<T extends SyncableDatabase> {
         await _upsertRows(backendTable, outgoing);
         await _markPushed(syncable, outgoing);
       } on PostgrestException catch (batchError) {
-        // The backend rejected at least one row in the batch (constraint / RLS /
-        // check). Previously this threw out of the whole table push and wedged
-        // every other row — and every later table — until the poison row was
-        // gone. Instead, retry row-by-row so the good rows still flush and the
-        // poison row is isolated (MC-424 §B).
+        if (_isTransientPostgrest(batchError)) {
+          // PostgREST reports rate limits (429) and server errors (5xx) as
+          // PostgrestExceptions too. Those are transient: re-enqueue the WHOLE
+          // batch and back off — never fall through to per-row, which would
+          // quarantine healthy rows over a passing backend hiccup (MC-424 §B/§C).
+          for (final row in outgoing) {
+            outQueue[row.id] = row;
+          }
+          _logger.warning(
+            'Transient PostgrestException pushing to $backendTable '
+            '($batchError); will retry',
+          );
+          return;
+        }
+
+        // A permanent rejection of at least one row in the batch (constraint /
+        // RLS / check). Previously this threw out of the whole table push and
+        // wedged every other row — and every later table — until the poison row
+        // was gone. Instead, retry row-by-row so the good rows still flush and
+        // the poison row is isolated (MC-424 §B).
         _logger.warning(
           'Batch upsert to $backendTable rejected ($batchError); '
           'falling back to per-row',
@@ -828,14 +857,21 @@ class SyncManager<T extends SyncableDatabase> {
             await _upsertRows(backendTable, {row});
             succeeded.add(row);
           } on PostgrestException catch (rowError, rowStack) {
-            // Permanent rejection of this specific row. Quarantine + report; the
-            // row stays in the local db with dirty=true, so NOTHING is lost — it
-            // simply stops jamming the queue and will retry on next restart.
-            quarantined.add(row.id);
-            _logger.severe(
-              'Quarantined poison row ${row.id} in $backendTable after backend '
-              'rejection: $rowError\n$rowStack',
-            );
+            if (_isTransientPostgrest(rowError)) {
+              // Transient (rate limit / server error) mid-fallback — keep for
+              // retry; do NOT quarantine over a passing backend failure.
+              retry.add(row);
+            } else {
+              // Permanent rejection of this specific row. Quarantine + report;
+              // the row stays in the local db with dirty=true, so NOTHING is
+              // lost — it simply stops jamming the queue and retries on next
+              // restart.
+              quarantined.add(row.id);
+              _logger.severe(
+                'Quarantined poison row ${row.id} in $backendTable after '
+                'backend rejection: $rowError\n$rowStack',
+              );
+            }
           } catch (_) {
             // Transient (e.g. network dropped mid-fallback) — keep for retry.
             retry.add(row);
@@ -1019,13 +1055,18 @@ class SyncManager<T extends SyncableDatabase> {
   ) async {
     if (writes.isEmpty) return;
 
-    final itemsToInsert = [
+    // Type the lists as Insertable<S> (the concrete syncable type) — the records
+    // carry the companion as the erased UpdateCompanion<Syncable>, but batch
+    // insertAll/replaceAll expect Insertable<S>. The runtime object is the
+    // concrete companion (e.g. CircleMembersCompanion implements Insertable<S>),
+    // so the cast is sound and keeps the call statically type-safe.
+    final itemsToInsert = <Insertable<S>>[
       for (final w in writes)
-        if (w.insert) w.companion,
+        if (w.insert) w.companion as Insertable<S>,
     ];
-    final itemsToReplace = [
+    final itemsToReplace = <Insertable<S>>[
       for (final w in writes)
-        if (!w.insert) w.companion,
+        if (!w.insert) w.companion as Insertable<S>,
     ];
     final writtenIds = [for (final w in writes) w.id];
 
