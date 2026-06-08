@@ -629,11 +629,22 @@ class SyncManager<T extends SyncableDatabase> {
   ///
   /// It can also be called manually to force a sync (still requires syncing
   /// to be enabled via [enableSync]).
-  Future<void> syncTables() async {
-    await _syncTables('Manual sync');
+  ///
+  /// Set [fullResync] to force a FULL sweep that ignores the incremental
+  /// last-pull watermark (and the "skip if no other device was active" guard).
+  /// The normal reconcile only asks the backend for rows changed since the last
+  /// pull, which is unsound when the set of rows the client may read GROWS for a
+  /// non-temporal reason — e.g. gaining access to a row (via RLS) whose
+  /// `updatedAt` predates that watermark. Such rows are never newer than the
+  /// watermark, so an incremental sweep skips them indefinitely; a full resync
+  /// pulls them. Call this right after any membership/permission change that can
+  /// widen visibility. The watermark is still advanced afterwards, so subsequent
+  /// reconciles return to being incremental.
+  Future<void> syncTables({bool fullResync = false}) async {
+    await _syncTables('Manual sync', fullResync: fullResync);
   }
 
-  Future<void> _syncTables(String reason) async {
+  Future<void> _syncTables(String reason, {bool fullResync = false}) async {
     if (!__syncingEnabled) {
       _logger.warning('Tables not getting synced because syncing is disabled');
       return;
@@ -647,13 +658,13 @@ class SyncManager<T extends SyncableDatabase> {
     _logger.info('Syncing all tables. Reason: $reason');
 
     for (final syncable in _syncables) {
-      await _syncTable(syncable);
+      await _syncTable(syncable, fullResync: fullResync);
     }
 
     _nFullSyncs++;
   }
 
-  Future<void> _syncTable(Type syncable) async {
+  Future<void> _syncTable(Type syncable, {bool fullResync = false}) async {
     if (!_syncingEnabled) return;
 
     final localItems = await _localDb.select(_localTables[syncable]!).get();
@@ -666,7 +677,11 @@ class SyncManager<T extends SyncableDatabase> {
     // receivedItems dedup below still guards against echoing pulled rows.
     _pushLocalChangesToOutQueue(syncable, localItems);
 
-    if (_skipSyncFromBackend(syncable)) {
+    // A forced full resync must always pull: the caller is widening visibility
+    // (e.g. a just-joined circle), so the "no other device was active" shortcut
+    // — which is only about avoiding redundant pulls of unchanged data — must
+    // not suppress it.
+    if (!fullResync && _skipSyncFromBackend(syncable)) {
       _logger.info(
         'Skipping sync of table ${_backendTables[syncable]} from backend '
         'because no other device was active since last sync',
@@ -681,7 +696,10 @@ class SyncManager<T extends SyncableDatabase> {
     // in flight has updatedAt >= pullStartedAt, so the next reconcile's
     // `> pullStartedAt - overlap` filter still catches it.
     final pullStartedAt = DateTime.now().toUtc();
-    final backendItems = await _fetchBackendItemMetadata(syncable);
+    final backendItems = await _fetchBackendItemMetadata(
+      syncable,
+      fullResync: fullResync,
+    );
 
     final itemsToPull = _getItemsToPullFromBackend(
       backendItems,
@@ -732,8 +750,9 @@ class SyncManager<T extends SyncableDatabase> {
   /// syncable in the backend. These can be used to determine which items need
   /// to be synced from the backend.
   Future<List<Map<String, dynamic>>> _fetchBackendItemMetadata(
-    Type syncable,
-  ) async {
+    Type syncable, {
+    bool fullResync = false,
+  }) async {
     final List<Map<String, dynamic>> backendItems = [];
 
     // MC-413 item 4: incremental sweep. Once we have a watermark from a previous
@@ -745,7 +764,10 @@ class SyncManager<T extends SyncableDatabase> {
     // may hand back a local DateTime, and toIso8601String() on a local time
     // omits the 'Z' the backend needs — a silent timezone mismatch in the
     // server-side `updated_at >` filter.
-    final lastPulled = _lastPulledTimestamp(syncable)?.toUtc();
+    // A forced full resync deliberately discards the watermark so the sweep is
+    // unbounded — see [syncTables]'s `fullResync`. Rows that became newly
+    // readable but predate the watermark are only caught by an unbounded sweep.
+    final lastPulled = fullResync ? null : _lastPulledTimestamp(syncable)?.toUtc();
     final changedSince = lastPulled?.subtract(_reconcileOverlap);
 
     int offset = 0;
