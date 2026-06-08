@@ -186,7 +186,14 @@ class SyncManager<T extends SyncableDatabase> {
   /// set, so nothing is lost; this in-memory set just stops them being retried
   /// every loop (which would spin and flood error reporting). It is cleared on
   /// restart, so a fixed row gets another chance.
-  final Map<Type, Set<String>> _quarantined = {};
+  ///
+  /// Outgoing and incoming quarantines are SEPARATE on purpose: a row we can't
+  /// *push* must still be *pullable*, so a backend fix or a newer tombstone from
+  /// another device can land and supersede the stale local copy. Sharing one set
+  /// would let an outbound-poison id suppress its own valid inbound update until
+  /// restart.
+  final Map<Type, Set<String>> _outgoingQuarantined = {};
+  final Map<Type, Set<String>> _incomingQuarantined = {};
 
   final Map<Type, StreamSubscription<List<Syncable>>> _localSubscriptions = {};
 
@@ -265,7 +272,8 @@ class SyncManager<T extends SyncableDatabase> {
     _outQueues[S] = {};
     _sentItems[S] = {};
     _receivedItems[S] = {};
-    _quarantined[S] = {};
+    _outgoingQuarantined[S] = {};
+    _incomingQuarantined[S] = {};
   }
 
   Future<void> _startLoop() async {
@@ -800,7 +808,7 @@ class SyncManager<T extends SyncableDatabase> {
   Future<void> _processOutgoing(Type syncable) async {
     final outQueue = _outQueues[syncable]!;
     final backendTable = _backendTables[syncable]!;
-    final quarantined = _quarantined[syncable]!;
+    final quarantined = _outgoingQuarantined[syncable]!;
 
     while (_syncingEnabled && outQueue.isNotEmpty) {
       // GAM-389: push every queued row regardless of owner; RLS authorizes the
@@ -954,7 +962,7 @@ class SyncManager<T extends SyncableDatabase> {
 
     final sentItems = _sentItems[syncable]!;
     final receivedItems = _receivedItems[syncable]!;
-    final quarantined = _quarantined[syncable]!;
+    final quarantined = _incomingQuarantined[syncable]!;
 
     final itemsToWrite = <String, Syncable>{};
 
@@ -962,7 +970,8 @@ class SyncManager<T extends SyncableDatabase> {
       // Skip if already processed, or if a previous write of this row was
       // permanently rejected locally (e.g. it collides with a divergent local
       // row) — quarantined so it can't re-wedge the whole incoming batch every
-      // pull (MC-424 §B).
+      // pull (MC-424 §B). This is the INCOMING quarantine only; a row we failed
+      // to push is deliberately still pullable.
       if (sentItems.contains(item) ||
           receivedItems.contains(item) ||
           quarantined.contains(item.id)) {
@@ -1023,7 +1032,7 @@ class SyncManager<T extends SyncableDatabase> {
         'Incoming batch write to ${_backendTables[syncable]} failed '
         '($batchError); falling back to per-row',
       );
-      final quarantined = _quarantined[syncable]!;
+      final quarantined = _incomingQuarantined[syncable]!;
       for (final write in decided) {
         try {
           await _writeIncomingRows(syncable, table, [write]);

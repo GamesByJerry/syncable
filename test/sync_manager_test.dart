@@ -347,6 +347,111 @@ void main() {
   );
 
   test(
+    'an outgoing-quarantined (un-pushable) row is still pullable — the '
+    'outgoing quarantine must not suppress incoming',
+    () async {
+      const poisonId = 'out-poison-still-pullable-id';
+
+      // The backend permanently rejects any PUSH carrying the poison row, so it
+      // lands in the OUTGOING quarantine.
+      when(
+        mockHttpClient.post(
+          any,
+          headers: anyNamed('headers'),
+          body: anyNamed('body'),
+        ),
+      ).thenAnswer((inv) async {
+        final body = inv.namedArguments[#body] as String;
+        final rows = (jsonDecode(body) as List).cast<Map<String, dynamic>>();
+        if (rows.any((r) => r[idKey] == poisonId)) {
+          return Response(
+            jsonEncode({
+              'code': '23505',
+              'message': 'duplicate key value violates unique constraint',
+              'details': null,
+              'hint': null,
+            }),
+            409,
+            request: Request('POST', Uri()),
+            headers: {'content-type': 'application/json; charset=utf-8'},
+          );
+        }
+        return Response(
+          jsonEncode(rows),
+          200,
+          request: Request('POST', Uri()),
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        );
+      });
+
+      final syncManager = SyncManager<TestDatabase>(
+        localDatabase: testDb,
+        supabaseClient: mockSupabaseClient,
+        syncInterval: const Duration(milliseconds: 1),
+      );
+      syncManager.registerSyncable<Item>(
+        backendTable: itemsTable,
+        fromJson: Item.fromJson,
+        companionConstructor: ItemsCompanion.new,
+      );
+
+      final userId = const Uuid().v4();
+      syncManager.enableSync();
+      syncManager.setUserId(userId);
+
+      // A local dirty poison row (v1) that can't be pushed.
+      await testDb.into(testDb.items).insert(
+        ItemsCompanion(
+          id: const drift.Value(poisonId),
+          userId: drift.Value(userId),
+          updatedAt: drift.Value(
+            DateTime.now().subtract(const Duration(minutes: 1)),
+          ),
+          deleted: const drift.Value(false),
+          name: const drift.Value('Poison v1'),
+        ),
+      );
+
+      // The backend holds a NEWER version of the SAME id — e.g. another device
+      // fixed it. With a shared quarantine this pull would be dropped; with the
+      // outgoing/incoming split it must land.
+      final backendV2 = Item(
+        id: poisonId,
+        userId: userId,
+        updatedAt: DateTime.now().add(const Duration(minutes: 1)),
+        deleted: false,
+        name: 'Backend v2',
+      );
+      when(mockHttpClient.get(any, headers: anyNamed('headers'))).thenAnswer(
+        (_) async => Response(
+          jsonEncode([backendV2.toJson()]),
+          200,
+          request: Request('GET', Uri()),
+        ),
+      );
+
+      // Drive sync explicitly (as the other pull tests do). Despite the push
+      // staying quarantined, the newer backend version is pulled and written
+      // over the local row — proving the outgoing quarantine doesn't suppress
+      // the incoming pull.
+      await waitForFunctionToPass(() async {
+        await syncManager.syncTables();
+        final row = await (testDb.select(
+          testDb.items,
+        )..where((t) => t.id.equals(poisonId))).getSingle();
+        expect(
+          row.name,
+          'Backend v2',
+          reason: 'incoming pull must not be blocked by the outgoing quarantine',
+        );
+        expect(row.dirty, isFalse, reason: 'pulled row is clean');
+      });
+
+      syncManager.dispose();
+    },
+  );
+
+  test(
     'Only subscribes to backend changes if other devices are active',
     () async {
       final syncManager = SyncManager<TestDatabase>(
