@@ -178,6 +178,30 @@ class SyncManager<T extends SyncableDatabase> {
   final Map<Type, Set<Syncable>> _sentItems = {};
   final Map<Type, Set<Syncable>> _receivedItems = {};
 
+  /// Ids of rows the backend has *permanently* rejected on push (e.g. a
+  /// constraint or RLS violation). A poison row used to throw out of the whole
+  /// table batch and wedge every other row's sync indefinitely; instead we
+  /// isolate it here so the rest of the table — and every later table — keeps
+  /// flushing. Quarantined rows are NOT deleted and their `dirty` flag is left
+  /// set, so nothing is lost; this in-memory set just stops them being retried
+  /// every loop (which would spin and flood error reporting). It is cleared on
+  /// restart, so a fixed row gets another chance.
+  ///
+  /// Outgoing and incoming quarantines are SEPARATE on purpose: a row we can't
+  /// *push* must still be *pullable*, so a backend fix or a newer tombstone from
+  /// another device can land and supersede the stale local copy. Sharing one set
+  /// would let an outbound-poison id suppress its own valid inbound update until
+  /// restart.
+  ///
+  /// Each map is keyed id -> the `updatedAt` of the version that failed. A row is
+  /// only skipped while the pending version is NOT newer than the quarantined
+  /// one; a strictly-newer version (a local edit that may fix a push, or a
+  /// remote fix/tombstone on pull) is let through to retry, and re-quarantined at
+  /// its own version if it fails again. This stops a once-poison row from being
+  /// stuck until restart when the underlying conflict is resolved.
+  final Map<Type, Map<String, DateTime>> _outgoingQuarantined = {};
+  final Map<Type, Map<String, DateTime>> _incomingQuarantined = {};
+
   final Map<Type, StreamSubscription<List<Syncable>>> _localSubscriptions = {};
 
   RealtimeChannel? _backendSubscription;
@@ -255,6 +279,8 @@ class SyncManager<T extends SyncableDatabase> {
     _outQueues[S] = {};
     _sentItems[S] = {};
     _receivedItems[S] = {};
+    _outgoingQuarantined[S] = {};
+    _incomingQuarantined[S] = {};
   }
 
   Future<void> _startLoop() async {
@@ -772,16 +798,39 @@ class SyncManager<T extends SyncableDatabase> {
         .map((backendItem) => backendItem[idKey]! as String);
   }
 
+  /// PostgREST surfaces transport-level failures — rate limits (429) and server
+  /// errors (5xx) — as [PostgrestException]s with the HTTP status in [code], the
+  /// same field that otherwise carries a Postgres SQLSTATE (e.g. '23505',
+  /// '42501'). Those SQLSTATEs are PERMANENT for the row (constraint / RLS /
+  /// check) and must be quarantined; 429 / 5xx are TRANSIENT and must be retried.
+  ///
+  /// We parse [code] as an int and treat it as transient only for a real HTTP
+  /// status (429, or 5xx below 600). The `< 600` guard stops a 5-digit SQLSTATE
+  /// like 23505 from being misread as ">= 500".
+  static bool _isTransientPostgrest(PostgrestException e) {
+    final status = int.tryParse(e.code ?? '');
+    return status != null && (status == 429 || (status >= 500 && status < 600));
+  }
+
   Future<void> _processOutgoing(Type syncable) async {
     final outQueue = _outQueues[syncable]!;
     final backendTable = _backendTables[syncable]!;
-    final sentItems = _sentItems[syncable]!;
-    final table = _localTables[syncable]!;
+    final quarantined = _outgoingQuarantined[syncable]!;
 
     while (_syncingEnabled && outQueue.isNotEmpty) {
       // GAM-389: push every queued row regardless of owner; RLS authorizes the
       // write and onConflict:id makes it an idempotent upsert.
-      final outgoing = Set<Syncable>.from(outQueue.values);
+      //
+      // Skip rows the backend has permanently rejected (quarantined): a single
+      // poison row must never re-wedge the whole table (MC-424 §B). A row whose
+      // version moved on since it was quarantined (a local edit that may fix the
+      // rejection) is let through to retry.
+      final outgoing = outQueue.values
+          .where((s) {
+            final failedAt = quarantined[s.id];
+            return failedAt == null || s.updatedAt.isAfter(failedAt);
+          })
+          .toSet();
       outQueue.clear();
 
       if (outgoing.isEmpty) continue;
@@ -792,44 +841,129 @@ class SyncManager<T extends SyncableDatabase> {
 
       assert(!outgoing.any((s) => s.userId?.isEmpty ?? true));
 
-      await _supabaseClient
-          .from(backendTable)
-          .upsert(
-            outgoing.map((x) => x.toJson()).toList(),
-            // GAM-389: conflict on id alone — one row per entity, not per user.
-            onConflict: idKey,
+      try {
+        await _upsertRows(backendTable, outgoing);
+        await _markPushed(syncable, outgoing);
+      } on PostgrestException catch (batchError) {
+        if (_isTransientPostgrest(batchError)) {
+          // PostgREST reports rate limits (429) and server errors (5xx) as
+          // PostgrestExceptions too. Those are transient: re-enqueue the WHOLE
+          // batch and back off — never fall through to per-row, which would
+          // quarantine healthy rows over a passing backend hiccup (MC-424 §B/§C).
+          for (final row in outgoing) {
+            outQueue[row.id] = row;
+          }
+          _logger.warning(
+            'Transient PostgrestException pushing to $backendTable '
+            '($batchError); will retry',
           );
-
-      sentItems.addAll(outgoing);
-
-      // The pushed rows are now in sync with the backend — clear their dirty
-      // flag so they are not re-pushed next cycle / after a restart. Guard each
-      // clear on the exact updatedAt we pushed: if the user edited the row again
-      // while this batch was in flight, its updatedAt has moved on, the match
-      // fails, dirty stays true, and the newer edit pushes next cycle.
-      final cleanCompanion =
-          _companions[syncable]!(dirty: const Value(false))
-              as UpdateCompanion<Syncable>;
-      await _localDb.batch((batch) {
-        for (final row in outgoing) {
-          batch.update(
-            table,
-            cleanCompanion,
-            where: (tbl) =>
-                tbl.id.equals(row.id) & tbl.updatedAt.equals(row.updatedAt),
-          );
+          return;
         }
-      });
 
-      _nSyncedToBackend[syncable] =
-          nSyncedToBackend(syncable) + outgoing.length;
+        // A permanent rejection of at least one row in the batch (constraint /
+        // RLS / check). Previously this threw out of the whole table push and
+        // wedged every other row — and every later table — until the poison row
+        // was gone. Instead, retry row-by-row so the good rows still flush and
+        // the poison row is isolated (MC-424 §B).
+        _logger.warning(
+          'Batch upsert to $backendTable rejected ($batchError); '
+          'falling back to per-row',
+        );
 
-      final lastUpdatedAtForThisBatch = outgoing.map((r) => r.updatedAt).max;
+        final succeeded = <Syncable>{};
+        final retry = <Syncable>{};
+        for (final row in outgoing) {
+          try {
+            await _upsertRows(backendTable, {row});
+            succeeded.add(row);
+          } on PostgrestException catch (rowError, rowStack) {
+            if (_isTransientPostgrest(rowError)) {
+              // Transient (rate limit / server error) mid-fallback — keep for
+              // retry; do NOT quarantine over a passing backend failure.
+              retry.add(row);
+            } else {
+              // Permanent rejection of this specific row. Quarantine at this
+              // version + report; the row stays in the local db with dirty=true,
+              // so NOTHING is lost — it stops jamming the queue, and a later edit
+              // (newer updatedAt) or a restart gives it another chance.
+              quarantined[row.id] = row.updatedAt;
+              _logger.severe(
+                'Quarantined poison row ${row.id} in $backendTable after '
+                'backend rejection: $rowError\n$rowStack',
+              );
+            }
+          } catch (_) {
+            // Transient (e.g. network dropped mid-fallback) — keep for retry.
+            retry.add(row);
+          }
+        }
 
-      if (_lastPushedTimestamp(syncable) == null ||
-          lastUpdatedAtForThisBatch.isAfter(_lastPushedTimestamp(syncable)!)) {
-        await _updateLastPushedTimestamp(syncable, lastUpdatedAtForThisBatch);
+        await _markPushed(syncable, succeeded);
+
+        if (retry.isNotEmpty) {
+          // Re-enqueue the rows we never got a verdict on so the next loop pass
+          // retries them, then back off (don't spin this pass).
+          for (final row in retry) {
+            outQueue[row.id] = row;
+          }
+          return;
+        }
+      } catch (batchError) {
+        // Transient failure (network, etc.): re-enqueue the whole batch so it is
+        // retried next pass — never dropped (MC-424 §C) — and back off.
+        for (final row in outgoing) {
+          outQueue[row.id] = row;
+        }
+        _logger.warning(
+          'Transient failure pushing to $backendTable ($batchError); '
+          'will retry',
+        );
+        return;
       }
+    }
+  }
+
+  Future<void> _upsertRows(String backendTable, Iterable<Syncable> rows) async {
+    await _supabaseClient.from(backendTable).upsert(
+      rows.map((x) => x.toJson()).toList(),
+      // GAM-389: conflict on id alone — one row per entity, not per user.
+      onConflict: idKey,
+    );
+  }
+
+  /// Marks [pushed] rows as synced: records them as sent, clears their `dirty`
+  /// flag, and advances counters / the last-pushed watermark.
+  Future<void> _markPushed(Type syncable, Set<Syncable> pushed) async {
+    if (pushed.isEmpty) return;
+
+    final table = _localTables[syncable]!;
+    _sentItems[syncable]!.addAll(pushed);
+
+    // The pushed rows are now in sync with the backend — clear their dirty flag
+    // so they are not re-pushed next cycle / after a restart. Guard each clear on
+    // the exact updatedAt we pushed: if the user edited the row again while this
+    // batch was in flight, its updatedAt has moved on, the match fails, dirty
+    // stays true, and the newer edit pushes next cycle.
+    final cleanCompanion =
+        _companions[syncable]!(dirty: const Value(false))
+            as UpdateCompanion<Syncable>;
+    await _localDb.batch((batch) {
+      for (final row in pushed) {
+        batch.update(
+          table,
+          cleanCompanion,
+          where: (tbl) =>
+              tbl.id.equals(row.id) & tbl.updatedAt.equals(row.updatedAt),
+        );
+      }
+    });
+
+    _nSyncedToBackend[syncable] = nSyncedToBackend(syncable) + pushed.length;
+
+    final lastUpdatedAtForThisBatch = pushed.map((r) => r.updatedAt).max;
+    if (_lastPushedTimestamp(syncable) == null ||
+        lastUpdatedAtForThisBatch.isAfter(_lastPushedTimestamp(syncable)!)) {
+      await _updateLastPushedTimestamp(syncable, lastUpdatedAtForThisBatch);
     }
   }
 
@@ -840,12 +974,22 @@ class SyncManager<T extends SyncableDatabase> {
 
     final sentItems = _sentItems[syncable]!;
     final receivedItems = _receivedItems[syncable]!;
+    final quarantined = _incomingQuarantined[syncable]!;
 
     final itemsToWrite = <String, Syncable>{};
 
     for (final item in inQueue) {
-      // Skip if already processed
-      if (sentItems.contains(item) || receivedItems.contains(item)) {
+      // Skip if already processed, or if a previous write of this row was
+      // permanently rejected locally (e.g. it collides with a divergent local
+      // row) — quarantined so it can't re-wedge the whole incoming batch every
+      // pull (MC-424 §B). This is the INCOMING quarantine only; a row we failed
+      // to push is deliberately still pullable. The quarantine is versioned: a
+      // strictly-newer backend version (a remote fix / tombstone) is let through
+      // to retry rather than dropped until restart.
+      final failedAt = quarantined[item.id];
+      if (sentItems.contains(item) ||
+          receivedItems.contains(item) ||
+          (failedAt != null && !item.updatedAt.isAfter(failedAt))) {
         continue;
       }
       itemsToWrite[item.id] = item;
@@ -876,48 +1020,97 @@ class SyncManager<T extends SyncableDatabase> {
               Map.fromEntries(items.map((i) => MapEntry(i.id, i.updatedAt))),
         );
 
-    final itemsToInsert = <UpdateCompanion<Syncable>>[];
-    final itemsToReplace = <UpdateCompanion<Syncable>>[];
-    final writtenIds = <String>[];
-
+    // Decide insert-vs-replace per row, keeping each row's verdict so a failed
+    // batch can be retried one row at a time.
+    final decided = <({String id, UpdateCompanion<Syncable> companion, bool insert})>[];
     for (final incomingItem in incomingItems.values) {
       final existingUpdatedAt = existingItems[incomingItem.id];
       if (existingUpdatedAt == null) {
-        itemsToInsert.add(incomingItem.toCompanion());
-        writtenIds.add(incomingItem.id);
+        decided.add((id: incomingItem.id, companion: incomingItem.toCompanion(), insert: true));
       } else if (incomingItem.updatedAt.isAfter(existingUpdatedAt)) {
-        itemsToReplace.add(incomingItem.toCompanion());
-        writtenIds.add(incomingItem.id);
+        decided.add((id: incomingItem.id, companion: incomingItem.toCompanion(), insert: false));
       }
       // else: local copy is newer — leave it (and its dirty flag) untouched so a
       // pending local edit still gets pushed.
     }
 
-    // A pulled row is not a local change. toCompanion() defaults dirty=true (so
-    // the app's own writes are pushed), so the incoming write must clear it —
-    // otherwise the next sync would push the row straight back to the backend.
-    //
-    // Do the write + clear in ONE transaction so the local-change stream only
-    // ever observes the final state (dirty=false). Without the transaction the
-    // intermediate dirty=true write could be picked up by the local-changes
-    // subscription and queued for push before we clear it.
+    if (decided.isEmpty) return;
+
+    try {
+      await _writeIncomingRows(syncable, table, decided);
+    } on Exception catch (batchError) {
+      // A poison row (e.g. one that collides with a divergent local row on a
+      // secondary UNIQUE constraint) used to roll back the whole incoming
+      // transaction and wedge every pull for the table. Retry row-by-row so the
+      // good rows still land and the poison row is isolated (MC-424 §B).
+      _logger.warning(
+        'Incoming batch write to ${_backendTables[syncable]} failed '
+        '($batchError); falling back to per-row',
+      );
+      final quarantined = _incomingQuarantined[syncable]!;
+      for (final write in decided) {
+        try {
+          await _writeIncomingRows(syncable, table, [write]);
+        } catch (rowError, rowStack) {
+          // Quarantine at this row's version, so a strictly-newer backend
+          // version later supersedes it instead of being dropped until restart.
+          quarantined[write.id] = incomingItems[write.id]!.updatedAt;
+          _logger.severe(
+            'Quarantined poison incoming row ${write.id} in '
+            '${_backendTables[syncable]}: $rowError\n$rowStack',
+          );
+        }
+      }
+    }
+  }
+
+  /// Writes a set of already-decided incoming [writes] (insert or replace) and
+  /// clears their `dirty` flag, in ONE transaction.
+  ///
+  /// A pulled row is not a local change. `toCompanion()` defaults dirty=true (so
+  /// the app's own writes are pushed), so the incoming write must clear it —
+  /// otherwise the next sync would push the row straight back to the backend.
+  /// The write + clear share a transaction so the local-change stream only ever
+  /// observes the final state (dirty=false); otherwise the intermediate
+  /// dirty=true write could be picked up by the local-changes subscription and
+  /// queued for push before we clear it.
+  Future<void> _writeIncomingRows<S extends Syncable>(
+    Type syncable,
+    TableInfo<SyncableTable, S> table,
+    List<({String id, UpdateCompanion<Syncable> companion, bool insert})> writes,
+  ) async {
+    if (writes.isEmpty) return;
+
+    // Type the lists as Insertable<S> (the concrete syncable type) — the records
+    // carry the companion as the erased UpdateCompanion<Syncable>, but batch
+    // insertAll/replaceAll expect Insertable<S>. The runtime object is the
+    // concrete companion (e.g. CircleMembersCompanion implements Insertable<S>),
+    // so the cast is sound and keeps the call statically type-safe.
+    final itemsToInsert = <Insertable<S>>[
+      for (final w in writes)
+        if (w.insert) w.companion as Insertable<S>,
+    ];
+    final itemsToReplace = <Insertable<S>>[
+      for (final w in writes)
+        if (!w.insert) w.companion as Insertable<S>,
+    ];
+    final writtenIds = [for (final w in writes) w.id];
+
     await _localDb.transaction(() async {
       await _localDb.batch((batch) {
         batch.insertAll(table, itemsToInsert);
         batch.replaceAll(table, itemsToReplace);
       });
 
-      if (writtenIds.isNotEmpty) {
-        final cleanCompanion =
-            _companions[syncable]!(dirty: const Value(false))
-                as UpdateCompanion<S>;
-        // Chunk the id list: a single `isIn` over a large initial/backlog sync
-        // can exceed SQLite's variable limit (999) → "too many SQL variables".
-        for (final idChunk in writtenIds.slices(500)) {
-          await (_localDb.update(
-            table,
-          )..where((tbl) => tbl.id.isIn(idChunk))).write(cleanCompanion);
-        }
+      final cleanCompanion =
+          _companions[syncable]!(dirty: const Value(false))
+              as UpdateCompanion<S>;
+      // Chunk the id list: a single `isIn` over a large initial/backlog sync can
+      // exceed SQLite's variable limit (999) → "too many SQL variables".
+      for (final idChunk in writtenIds.slices(500)) {
+        await (_localDb.update(
+          table,
+        )..where((tbl) => tbl.id.isIn(idChunk))).write(cleanCompanion);
       }
     });
   }
