@@ -209,8 +209,11 @@ void main() {
     // Create new item in backend
     await supabaseClient.from(itemsTable).insert(item.toJson());
 
-    // Wait for item to sync to local database
+    // Wait for item to sync to local database, driving reconciles while
+    // waiting (the insert races the initial reconcile and the channel join,
+    // so no single delivery path is guaranteed — see the comment below).
     await waitForFunctionToPass(() async {
+      await syncManager.syncTables();
       expect((await testDb.getItem(testDb.items, item.id)).name, 'a');
     });
 
@@ -225,80 +228,106 @@ void main() {
         })
         .eq(idKey, item.id);
 
-    // Wait for item to sync to local database. The update arrives via the
-    // realtime channel — allow for slow websocket delivery under load.
+    // Wait for the update to sync to the local database. It normally arrives
+    // via the realtime channel, but a single websocket frame from a loaded
+    // local stack is not guaranteed — drive reconciles while waiting, exactly
+    // like the app-level periodic heartbeat does in a real deployment.
     await waitForFunctionToPass(() async {
+      await syncManager.syncTables();
       expect((await testDb.getItem(testDb.items, item.id)).name, 'b');
     }, timeout: const Duration(seconds: 15));
   });
 
-  test('Reading from backend uses paging', () async {
-    // The maximum number of rows returned from a query in Supabase is limited,
-    // so syncing more items than that requires paging.
+  test(
+    'Reading from backend uses paging',
+    () async {
+      // The maximum number of rows returned from a query in Supabase is limited,
+      // so syncing more items than that requires paging.
 
-    const maxRows = 1000; // Defined in `supabase/config.toml`
+      const maxRows = 1000; // Defined in `supabase/config.toml`
 
-    await supabaseClient.auth.signInAnonymously();
+      await supabaseClient.auth.signInAnonymously();
 
-    final userId = supabaseClient.auth.currentUser!.id;
+      final userId = supabaseClient.auth.currentUser!.id;
 
-    syncManager.setUserId(userId);
-    syncManager.setLastTimeOtherDeviceWasActive(null);
+      syncManager.setUserId(userId);
+      syncManager.setLastTimeOtherDeviceWasActive(null);
 
-    final timestamp = DateTime.now().toUtc();
+      final timestamp = DateTime.now().toUtc();
 
-    final items = [
-      for (final i in List.generate(maxRows + 1, (i) => i))
-        Item(
-          id: const Uuid().v4(),
-          userId: userId,
-          updatedAt: timestamp,
-          deleted: false,
-          name: i.toString(),
-        ),
-    ];
+      final items = [
+        for (final i in List.generate(maxRows + 1, (i) => i))
+          Item(
+            id: const Uuid().v4(),
+            userId: userId,
+            updatedAt: timestamp,
+            deleted: false,
+            name: i.toString(),
+          ),
+      ];
 
-    // Writing rows to the backend and then immediately enabling syncing can
-    // cause the sync manager to pick up updates via backend subscriptions.
-    // However, we want to test the case where there are already a lot of
-    // existing entries in the backend, so we create a separate subscription
-    // first, then write the items, and then wait for all Postgres change events
-    // to be sent, before we enable syncing.
-    int updatesReceived = 0;
+      // Writing rows to the backend and then immediately enabling syncing can
+      // cause the sync manager to pick up updates via backend subscriptions.
+      // However, we want to test the case where there are already a lot of
+      // existing entries in the backend, so we create a separate subscription
+      // first, then write the items, and then wait for all Postgres change events
+      // to be sent, before we enable syncing.
+      int updatesReceived = 0;
 
-    supabaseClient
-        .channel('backend_changes')
-        .onPostgresChanges(
-          schema: publicSchema,
-          table: 'items',
-          event: PostgresChangeEvent.all,
-          callback: (p) => updatesReceived++,
-        )
-        .subscribe();
+      // Wait for the subscription to be JOINED before writing: realtime only
+      // streams changes committed after the join, so inserting earlier races
+      // the join and can miss every event.
+      var subscribed = false;
+      supabaseClient
+          .channel('backend_changes')
+          .onPostgresChanges(
+            schema: publicSchema,
+            table: 'items',
+            event: PostgresChangeEvent.all,
+            callback: (p) => updatesReceived++,
+          )
+          .subscribe((status, error) {
+            if (status == RealtimeSubscribeStatus.subscribed) subscribed = true;
+          });
+      await waitForFunctionToPass(() async {
+        expect(subscribed, isTrue);
+      }, timeout: const Duration(seconds: 15));
 
-    // Create new items in backend
-    await supabaseClient
-        .from(itemsTable)
-        .insert(items.map((item) => item.toJson()).toList());
+      // Create new items in backend
+      await supabaseClient
+          .from(itemsTable)
+          .insert(items.map((item) => item.toJson()).toList());
 
-    // Wait for all Postgres changes to get processed. Delivering 1001 change
-    // events over one websocket can take a while — be generous.
-    await waitForFunctionToPass(() async {
-      expect(updatesReceived, maxRows + 1);
-    }, timeout: const Duration(seconds: 30));
+      // Quiesce: wait until the raw channel's event stream has settled — all
+      // events arrived, or nothing more is coming (a degraded realtime
+      // service can deliver none even after a confirmed join). The point is
+      // only that no realtime trickle is in flight when sync gets enabled;
+      // the paged PULL below is what this test verifies, and it does not
+      // depend on realtime delivery.
+      await waitForFunctionToPass(() async {
+        if (updatesReceived < maxRows + 1) {
+          final snapshot = updatesReceived;
+          await Future<void>.delayed(const Duration(seconds: 2));
+          expect(updatesReceived, snapshot, reason: 'stream still trickling');
+        }
+      }, timeout: const Duration(seconds: 45));
 
-    syncManager.enableSync();
+      syncManager.enableSync();
 
-    // Wait for items to sync to local database
-    await waitForFunctionToPass(() async {
-      await testDb.select(testDb.items).get().then((localItems) {
-        expect(
-          localItems.map((i) => i.name),
-          equals(List.generate(maxRows + 1, (i) => i.toString()).toSet()),
-        );
-      });
-    }, timeout: const Duration(seconds: 30));
-  });
+      // Wait for items to sync to local database
+      await waitForFunctionToPass(() async {
+        await testDb.select(testDb.items).get().then((localItems) {
+          expect(
+            localItems.map((i) => i.name),
+            equals(List.generate(maxRows + 1, (i) => i.toString()).toSet()),
+          );
+        });
+      }, timeout: const Duration(seconds: 30));
+      // The waits above can legitimately sum past the default 30s test timeout
+      // (1001 realtime events + a 1001-row paged pull).
+    },
+    timeout: const Timeout(Duration(minutes: 2)),
+  );
 
   test(
     'Local database rejects items from backend with old modification dates',

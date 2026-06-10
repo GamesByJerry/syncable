@@ -27,6 +27,10 @@ class FakeFieldCipher implements SyncFieldCipher {
   final List<String> encryptCalls = [];
   final List<String> decryptCalls = [];
 
+  /// Artificial per-blob decrypt latency (keyed by the exact `contentEnc`
+  /// string) — lets tests invert decode-completion order deterministically.
+  final Map<String, Duration> blobDecryptDelays = {};
+
   String _aad(String table, String rowId, String circleId, int keyVersion) =>
       '$table|$rowId|$circleId|$keyVersion';
 
@@ -91,6 +95,8 @@ class FakeFieldCipher implements SyncFieldCipher {
     required int keyVersion,
   }) async {
     decryptCalls.add(rowId);
+    final delay = blobDecryptDelays[contentEnc];
+    if (delay != null) await Future<void>.delayed(delay);
     if (!(keys[circleId]?.contains(keyVersion) ?? false)) {
       throw SyncCipherMissingKeyException(
         'No key v$keyVersion for circle $circleId',

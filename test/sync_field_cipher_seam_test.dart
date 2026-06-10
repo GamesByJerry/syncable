@@ -234,6 +234,181 @@ void main() {
     )..where((t) => t.id.equals(id))).getSingle();
   }
 
+  /// Reproduces the same-row realtime decode race (Codex P2 on PR #8):
+  ///
+  /// Two realtime events for one row arrive in backend order (old, new), but
+  /// the OLD one decrypts slower, so it finishes decoding — and enqueues —
+  /// last. Both must land in the same drain batch for the queue collapse to
+  /// be the deciding step, so the sync loop's pass is kept busy pushing a
+  /// dirty row of a second registered table ([Items]) whose mock upsert
+  /// responds slowly. Timeline (ms): 0 events fired → ~20 new enqueued →
+  /// ~60 old enqueued → ~250 items push returns, loop drains both together.
+  ///
+  /// With [withKey] the versions decrypt (content collapse case); without it
+  /// both arrive undecryptable under key versions 5/6 (locked-fallback
+  /// alignment case).
+  Future<
+    ({
+      SyncManager<TestDatabase> syncManager,
+      String rowId,
+      DateTime newUpdatedAt,
+      Map<String, dynamic> newWire,
+    })
+  >
+  runOutOfOrderRealtimeScenario({required bool withKey}) async {
+    final pgCallbacks = <String, void Function(PostgresChangePayload)>{};
+    when(
+      mockRealtimeChannel.onPostgresChanges(
+        schema: anyNamed('schema'),
+        table: anyNamed('table'),
+        event: anyNamed('event'),
+        callback: anyNamed('callback'),
+      ),
+    ).thenAnswer((inv) {
+      pgCallbacks[inv.namedArguments[#table] as String] =
+          inv.namedArguments[#callback] as void Function(PostgresChangePayload);
+      return mockRealtimeChannel;
+    });
+
+    // The items table gets its own (slow) upsert path; a POST is recognized
+    // as an items push by the presence of the `name` column.
+    final itemsQueryBuilder = MockSupabaseQueryBuilder();
+    final realQueryBuilder = PostgrestQueryBuilder(
+      url: Uri(),
+      httpClient: mockHttpClient,
+    );
+    when(
+      mockSupabaseClient.from(itemsTable),
+    ).thenAnswer((_) => itemsQueryBuilder);
+    when(
+      itemsQueryBuilder.upsert(any, onConflict: anyNamed('onConflict')),
+    ).thenAnswer(
+      (inv) => realQueryBuilder.upsert(
+        inv.positionalArguments[0] as Object,
+        onConflict: inv.namedArguments[#onConflict] as String?,
+      ),
+    );
+    when(itemsQueryBuilder.select(any)).thenAnswer(
+      (inv) => realQueryBuilder.select(inv.positionalArguments[0] as String),
+    );
+    var itemsPushStarted = false;
+    when(
+      mockHttpClient.post(
+        any,
+        headers: anyNamed('headers'),
+        body: anyNamed('body'),
+      ),
+    ).thenAnswer((inv) async {
+      final body = inv.namedArguments[#body] as String;
+      final rows = (jsonDecode(body) as List).cast<Map<String, dynamic>>();
+      if (rows.isNotEmpty && rows.first.containsKey(nameKey)) {
+        itemsPushStarted = true;
+        await Future<void>.delayed(const Duration(milliseconds: 250));
+      } else {
+        pushedBatches.add(rows);
+      }
+      return Response(
+        body,
+        200,
+        request: Request('POST', Uri()),
+        headers: {'content-type': 'application/json; charset=utf-8'},
+      );
+    });
+
+    final cipher = FakeFieldCipher()
+      ..circleModes[circleId] = SyncEncryptionMode.enforced;
+    if (withKey) cipher.keys[circleId] = {1};
+
+    final syncManager = SyncManager<TestDatabase>(
+      localDatabase: testDb,
+      supabaseClient: mockSupabaseClient,
+      syncInterval: const Duration(milliseconds: 1),
+      fieldCipher: cipher,
+    );
+    // Items first: each loop pass pushes Items before draining SecretItems'
+    // incoming queue, so the slow items POST holds the batch window open.
+    syncManager.registerSyncable<Item>(
+      backendTable: itemsTable,
+      fromJson: Item.fromJson,
+      companionConstructor: ItemsCompanion.new,
+    );
+    syncManager.registerSyncable<SecretItem>(
+      backendTable: secretItemsTable,
+      fromJson: SecretItem.fromJson,
+      companionConstructor: SecretItemsCompanion.new,
+      encryption: secretItemsEncryption(),
+    );
+
+    final userId = const Uuid().v4();
+    syncManager.setUserId(userId);
+    syncManager.enableSync();
+    await waitForFunctionToPass(
+      () async => expect(pgCallbacks, contains(secretItemsTable)),
+    );
+
+    final rowId = const Uuid().v4();
+    final oldUpdatedAt = DateTime.now().toUtc();
+    final newUpdatedAt = oldUpdatedAt.add(const Duration(seconds: 1));
+    final oldWire = enforcedWireRow(
+      cipher,
+      id: rowId,
+      userId: userId,
+      updatedAt: oldUpdatedAt,
+      title: 'old version',
+      amount: 1,
+      keyVersion: withKey ? 1 : 5,
+    );
+    final newWire = enforcedWireRow(
+      cipher,
+      id: rowId,
+      userId: userId,
+      updatedAt: newUpdatedAt,
+      title: 'new version',
+      amount: 2,
+      keyVersion: withKey ? 1 : 6,
+    );
+    // The OLDER event decrypts slower than the newer one.
+    cipher.blobDecryptDelays[oldWire[contentEncKey] as String] = const Duration(
+      milliseconds: 60,
+    );
+    cipher.blobDecryptDelays[newWire[contentEncKey] as String] = const Duration(
+      milliseconds: 20,
+    );
+
+    // Occupy the loop pass with a slow items push...
+    await testDb
+        .into(testDb.items)
+        .insert(
+          ItemsCompanion(
+            userId: drift.Value(userId),
+            updatedAt: drift.Value(DateTime.now().toUtc()),
+            name: const drift.Value('keeps the loop busy'),
+          ),
+        );
+    await waitForFunctionToPass(() async => expect(itemsPushStarted, isTrue));
+
+    // ...and deliver both events, in backend order, while it is blocked.
+    PostgresChangePayload payload(Map<String, dynamic> wire) =>
+        PostgresChangePayload(
+          schema: 'public',
+          table: secretItemsTable,
+          commitTimestamp: DateTime.now(),
+          eventType: PostgresChangeEvent.update,
+          newRecord: wire,
+          oldRecord: const {},
+          errors: null,
+        );
+    pgCallbacks[secretItemsTable]!(payload(oldWire));
+    pgCallbacks[secretItemsTable]!(payload(newWire));
+
+    return (
+      syncManager: syncManager,
+      rowId: rowId,
+      newUpdatedAt: newUpdatedAt,
+      newWire: newWire,
+    );
+  }
+
   group('Push', () {
     test(
       'enforced: content fields are nulled and the blob is attached; '
@@ -609,6 +784,45 @@ void main() {
         syncManager.dispose();
       },
     );
+
+    test('realtime events for the same row that decrypt out of order never let '
+        'an older version shadow a newer one', () async {
+      // Codex P2 on PR #8: decode is fire-and-forget, so two events for the
+      // same id can enqueue in decrypt-COMPLETION order. When both land in
+      // the same drain batch (here: the loop pass is busy pushing another
+      // table), the queue collapse must keep the newest updatedAt, not the
+      // last-enqueued entry.
+      final scenario = await runOutOfOrderRealtimeScenario(withKey: true);
+
+      await waitForFunctionToPass(() async {
+        final row = await localRow(scenario.rowId);
+        expect(row.title, 'new version');
+        expect(row.amount, 2);
+        expect(row.updatedAt, scenario.newUpdatedAt);
+        expect(row.locked, isFalse);
+      });
+
+      scenario.syncManager.dispose();
+    });
+
+    test('out-of-order LOCKED decodes keep the preserved ciphertext aligned '
+        'with the newest version (no blob ever dropped)', () async {
+      // Same race as above, but neither version is decryptable: the locked
+      // fallback instruction must stay version-aligned with the surviving
+      // row — a mismatched instruction must never strip a locked row of
+      // its ciphertext.
+      final scenario = await runOutOfOrderRealtimeScenario(withKey: false);
+
+      await waitForFunctionToPass(() async {
+        final row = await localRow(scenario.rowId);
+        expect(row.updatedAt, scenario.newUpdatedAt);
+        expect(row.locked, isTrue);
+        expect(row.lockedContentEnc, scenario.newWire[contentEncKey]);
+        expect(row.lockedKeyVersion, 6);
+      });
+
+      scenario.syncManager.dispose();
+    });
 
     test(
       'round-trip: an enforced push fed back through pull restores the exact '

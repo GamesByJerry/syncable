@@ -1291,11 +1291,20 @@ class SyncManager<T extends SyncableDatabase> {
       json[field] = encryption.lockedFieldPlaceholders[field];
     }
     final item = _fromJsons[syncable]!(json);
-    _pendingLockedBlobs[syncable]![item.id] = _PendingLockedBlob(
-      contentEnc: contentEnc,
-      keyVersion: keyVersion,
-      forUpdatedAt: item.updatedAt,
-    );
+    // Newest-wins, mirroring the incoming-queue collapse: locked decodes can
+    // complete out of order, and the preserved ciphertext must stay aligned
+    // with the row version that ultimately gets written — a version-mismatched
+    // instruction would be dropped at write time, stripping the locked row of
+    // its blob.
+    final pending = _pendingLockedBlobs[syncable]!;
+    final existing = pending[item.id];
+    if (existing == null || !existing.forUpdatedAt.isAfter(item.updatedAt)) {
+      pending[item.id] = _PendingLockedBlob(
+        contentEnc: contentEnc,
+        keyVersion: keyVersion,
+        forUpdatedAt: item.updatedAt,
+      );
+    }
     return item;
   }
 
@@ -1755,7 +1764,15 @@ class SyncManager<T extends SyncableDatabase> {
         _discardPendingLockedBlob(syncable, item);
         continue;
       }
-      itemsToWrite[item.id] = item;
+      // Newest-wins collapse per row id: queue arrival order is not version
+      // order — encrypted rows decode asynchronously and can complete out of
+      // order, and a websocket may redeliver across reconnects — so keeping
+      // the last-enqueued entry could let an older version shadow a newer one
+      // until the next reconcile.
+      final queued = itemsToWrite[item.id];
+      if (queued == null || item.updatedAt.isAfter(queued.updatedAt)) {
+        itemsToWrite[item.id] = item;
+      }
     }
 
     inQueue.clear();
