@@ -34,7 +34,8 @@ class TimestampStorage extends SyncTimestampStorage {
 /// incremental metadata filter still serializes as UTC.
 class LocalReturningTimestampStorage extends TimestampStorage {
   @override
-  DateTime? getSyncTimestamp(String key) => super.getSyncTimestamp(key)?.toLocal();
+  DateTime? getSyncTimestamp(String key) =>
+      super.getSyncTimestamp(key)?.toLocal();
 }
 
 void main() {
@@ -163,99 +164,100 @@ void main() {
     ).called(1);
   });
 
-  test(
-    'a backend-rejected poison row is isolated; the rest still flush '
-    'and the poison row is preserved (per-row fallback)',
-    () async {
-      const poisonId = 'poison-row-id';
+  test('a backend-rejected poison row is isolated; the rest still flush '
+      'and the poison row is preserved (per-row fallback)', () async {
+    const poisonId = 'poison-row-id';
 
-      // Reject any upsert whose body contains the poison row (simulates a
-      // constraint / RLS violation that previously wedged the whole batch).
-      when(
-        mockHttpClient.post(
-          any,
-          headers: anyNamed('headers'),
-          body: anyNamed('body'),
-        ),
-      ).thenAnswer((inv) async {
-        final body = inv.namedArguments[#body] as String;
-        final rows = (jsonDecode(body) as List).cast<Map<String, dynamic>>();
-        if (rows.any((r) => r[idKey] == poisonId)) {
-          return Response(
-            jsonEncode({
-              'code': '23505',
-              'message': 'duplicate key value violates unique constraint',
-              'details': null,
-              'hint': null,
-            }),
-            409,
-            request: Request('POST', Uri()),
-            headers: {'content-type': 'application/json; charset=utf-8'},
-          );
-        }
+    // Reject any upsert whose body contains the poison row (simulates a
+    // constraint / RLS violation that previously wedged the whole batch).
+    when(
+      mockHttpClient.post(
+        any,
+        headers: anyNamed('headers'),
+        body: anyNamed('body'),
+      ),
+    ).thenAnswer((inv) async {
+      final body = inv.namedArguments[#body] as String;
+      final rows = (jsonDecode(body) as List).cast<Map<String, dynamic>>();
+      if (rows.any((r) => r[idKey] == poisonId)) {
         return Response(
-          jsonEncode(rows),
-          200,
+          jsonEncode({
+            'code': '23505',
+            'message': 'duplicate key value violates unique constraint',
+            'details': null,
+            'hint': null,
+          }),
+          409,
           request: Request('POST', Uri()),
           headers: {'content-type': 'application/json; charset=utf-8'},
         );
-      });
-
-      final syncManager = SyncManager<TestDatabase>(
-        localDatabase: testDb,
-        supabaseClient: mockSupabaseClient,
-        syncInterval: const Duration(milliseconds: 1),
+      }
+      return Response(
+        jsonEncode(rows),
+        200,
+        request: Request('POST', Uri()),
+        headers: {'content-type': 'application/json; charset=utf-8'},
       );
-      syncManager.registerSyncable<Item>(
-        backendTable: itemsTable,
-        fromJson: Item.fromJson,
-        companionConstructor: ItemsCompanion.new,
-      );
+    });
 
-      final userId = const Uuid().v4();
-      syncManager.enableSync();
-      syncManager.setUserId(userId);
+    final syncManager = SyncManager<TestDatabase>(
+      localDatabase: testDb,
+      supabaseClient: mockSupabaseClient,
+      syncInterval: const Duration(milliseconds: 1),
+    );
+    syncManager.registerSyncable<Item>(
+      backendTable: itemsTable,
+      fromJson: Item.fromJson,
+      companionConstructor: ItemsCompanion.new,
+    );
 
-      // A poison row (always rejected) and a healthy row queued together.
-      await testDb.into(testDb.items).insert(
-        ItemsCompanion(
-          id: const drift.Value(poisonId),
-          userId: drift.Value(userId),
-          updatedAt: drift.Value(DateTime.now()),
-          deleted: const drift.Value(false),
-          name: const drift.Value('Poison'),
-        ),
-      );
-      final goodId = const Uuid().v4();
-      await testDb.into(testDb.items).insert(
-        ItemsCompanion(
-          id: drift.Value(goodId),
-          userId: drift.Value(userId),
-          updatedAt: drift.Value(DateTime.now()),
-          deleted: const drift.Value(false),
-          name: const drift.Value('Good'),
-        ),
-      );
+    final userId = const Uuid().v4();
+    syncManager.enableSync();
+    syncManager.setUserId(userId);
 
-      // The healthy row flushes (dirty cleared) despite the poison row sharing
-      // the table — no permanent wedge.
-      await waitForFunctionToPass(() async {
-        final good = await (testDb.select(
-          testDb.items,
-        )..where((t) => t.id.equals(goodId))).getSingle();
-        expect(good.dirty, isFalse, reason: 'healthy row flushed past poison');
-      });
+    // A poison row (always rejected) and a healthy row queued together.
+    await testDb
+        .into(testDb.items)
+        .insert(
+          ItemsCompanion(
+            id: const drift.Value(poisonId),
+            userId: drift.Value(userId),
+            updatedAt: drift.Value(DateTime.now()),
+            deleted: const drift.Value(false),
+            name: const drift.Value('Poison'),
+          ),
+        );
+    final goodId = const Uuid().v4();
+    await testDb
+        .into(testDb.items)
+        .insert(
+          ItemsCompanion(
+            id: drift.Value(goodId),
+            userId: drift.Value(userId),
+            updatedAt: drift.Value(DateTime.now()),
+            deleted: const drift.Value(false),
+            name: const drift.Value('Good'),
+          ),
+        );
 
-      // The poison row is preserved locally with dirty=true — quarantined, not
-      // lost. (This is the unsynced-data-safety guarantee.)
-      final poison = await (testDb.select(
+    // The healthy row flushes (dirty cleared) despite the poison row sharing
+    // the table — no permanent wedge.
+    await waitForFunctionToPass(() async {
+      final good = await (testDb.select(
         testDb.items,
-      )..where((t) => t.id.equals(poisonId))).getSingle();
-      expect(poison.dirty, isTrue, reason: 'poison row kept, not dropped');
+      )..where((t) => t.id.equals(goodId))).getSingle();
+      expect(good.dirty, isFalse, reason: 'healthy row flushed past poison');
+    });
 
-      syncManager.dispose();
-    },
-  );
+    // The poison row is preserved locally with dirty=true — quarantined, not
+    // lost. (This is the unsynced-data-safety guarantee.)
+    final poison = await (testDb.select(
+      testDb.items,
+    )..where((t) => t.id.equals(poisonId))).getSingle();
+    expect(poison.dirty, isTrue, reason: 'poison row kept, not dropped');
+
+    syncManager.dispose();
+  });
 
   test(
     'a transient backend failure (5xx/429) is retried, never quarantined',
@@ -314,15 +316,17 @@ void main() {
       syncManager.setUserId(userId);
 
       final id = const Uuid().v4();
-      await testDb.into(testDb.items).insert(
-        ItemsCompanion(
-          id: drift.Value(id),
-          userId: drift.Value(userId),
-          updatedAt: drift.Value(DateTime.now()),
-          deleted: const drift.Value(false),
-          name: const drift.Value('Flaky'),
-        ),
-      );
+      await testDb
+          .into(testDb.items)
+          .insert(
+            ItemsCompanion(
+              id: drift.Value(id),
+              userId: drift.Value(userId),
+              updatedAt: drift.Value(DateTime.now()),
+              deleted: const drift.Value(false),
+              name: const drift.Value('Flaky'),
+            ),
+          );
 
       // It eventually flushes once the backend recovers — proving it was retried
       // past the 503s, not quarantined after the first failure.
@@ -346,211 +350,207 @@ void main() {
     },
   );
 
-  test(
-    'an outgoing-quarantined (un-pushable) row is still pullable — the '
-    'outgoing quarantine must not suppress incoming',
-    () async {
-      const poisonId = 'out-poison-still-pullable-id';
+  test('an outgoing-quarantined (un-pushable) row is still pullable — the '
+      'outgoing quarantine must not suppress incoming', () async {
+    const poisonId = 'out-poison-still-pullable-id';
 
-      // The backend permanently rejects any PUSH carrying the poison row, so it
-      // lands in the OUTGOING quarantine.
-      when(
-        mockHttpClient.post(
-          any,
-          headers: anyNamed('headers'),
-          body: anyNamed('body'),
-        ),
-      ).thenAnswer((inv) async {
-        final body = inv.namedArguments[#body] as String;
-        final rows = (jsonDecode(body) as List).cast<Map<String, dynamic>>();
-        if (rows.any((r) => r[idKey] == poisonId)) {
-          return Response(
-            jsonEncode({
-              'code': '23505',
-              'message': 'duplicate key value violates unique constraint',
-              'details': null,
-              'hint': null,
-            }),
-            409,
-            request: Request('POST', Uri()),
-            headers: {'content-type': 'application/json; charset=utf-8'},
-          );
-        }
+    // The backend permanently rejects any PUSH carrying the poison row, so it
+    // lands in the OUTGOING quarantine.
+    when(
+      mockHttpClient.post(
+        any,
+        headers: anyNamed('headers'),
+        body: anyNamed('body'),
+      ),
+    ).thenAnswer((inv) async {
+      final body = inv.namedArguments[#body] as String;
+      final rows = (jsonDecode(body) as List).cast<Map<String, dynamic>>();
+      if (rows.any((r) => r[idKey] == poisonId)) {
         return Response(
-          jsonEncode(rows),
-          200,
+          jsonEncode({
+            'code': '23505',
+            'message': 'duplicate key value violates unique constraint',
+            'details': null,
+            'hint': null,
+          }),
+          409,
           request: Request('POST', Uri()),
           headers: {'content-type': 'application/json; charset=utf-8'},
         );
-      });
-
-      final syncManager = SyncManager<TestDatabase>(
-        localDatabase: testDb,
-        supabaseClient: mockSupabaseClient,
-        syncInterval: const Duration(milliseconds: 1),
+      }
+      return Response(
+        jsonEncode(rows),
+        200,
+        request: Request('POST', Uri()),
+        headers: {'content-type': 'application/json; charset=utf-8'},
       );
-      syncManager.registerSyncable<Item>(
-        backendTable: itemsTable,
-        fromJson: Item.fromJson,
-        companionConstructor: ItemsCompanion.new,
-      );
+    });
 
-      final userId = const Uuid().v4();
-      syncManager.enableSync();
-      syncManager.setUserId(userId);
+    final syncManager = SyncManager<TestDatabase>(
+      localDatabase: testDb,
+      supabaseClient: mockSupabaseClient,
+      syncInterval: const Duration(milliseconds: 1),
+    );
+    syncManager.registerSyncable<Item>(
+      backendTable: itemsTable,
+      fromJson: Item.fromJson,
+      companionConstructor: ItemsCompanion.new,
+    );
 
-      // A local dirty poison row (v1) that can't be pushed.
-      await testDb.into(testDb.items).insert(
-        ItemsCompanion(
-          id: const drift.Value(poisonId),
-          userId: drift.Value(userId),
-          updatedAt: drift.Value(
-            DateTime.now().subtract(const Duration(minutes: 1)),
+    final userId = const Uuid().v4();
+    syncManager.enableSync();
+    syncManager.setUserId(userId);
+
+    // A local dirty poison row (v1) that can't be pushed.
+    await testDb
+        .into(testDb.items)
+        .insert(
+          ItemsCompanion(
+            id: const drift.Value(poisonId),
+            userId: drift.Value(userId),
+            updatedAt: drift.Value(
+              DateTime.now().subtract(const Duration(minutes: 1)),
+            ),
+            deleted: const drift.Value(false),
+            name: const drift.Value('Poison v1'),
           ),
-          deleted: const drift.Value(false),
-          name: const drift.Value('Poison v1'),
-        ),
-      );
-
-      // The backend holds a NEWER version of the SAME id — e.g. another device
-      // fixed it. With a shared quarantine this pull would be dropped; with the
-      // outgoing/incoming split it must land.
-      final backendV2 = Item(
-        id: poisonId,
-        userId: userId,
-        updatedAt: DateTime.now().add(const Duration(minutes: 1)),
-        deleted: false,
-        name: 'Backend v2',
-      );
-      when(mockHttpClient.get(any, headers: anyNamed('headers'))).thenAnswer(
-        (_) async => Response(
-          jsonEncode([backendV2.toJson()]),
-          200,
-          request: Request('GET', Uri()),
-        ),
-      );
-
-      // Drive sync explicitly (as the other pull tests do). Despite the push
-      // staying quarantined, the newer backend version is pulled and written
-      // over the local row — proving the outgoing quarantine doesn't suppress
-      // the incoming pull.
-      await waitForFunctionToPass(() async {
-        await syncManager.syncTables();
-        final row = await (testDb.select(
-          testDb.items,
-        )..where((t) => t.id.equals(poisonId))).getSingle();
-        expect(
-          row.name,
-          'Backend v2',
-          reason: 'incoming pull must not be blocked by the outgoing quarantine',
         );
-        expect(row.dirty, isFalse, reason: 'pulled row is clean');
-      });
 
-      syncManager.dispose();
-    },
-  );
+    // The backend holds a NEWER version of the SAME id — e.g. another device
+    // fixed it. With a shared quarantine this pull would be dropped; with the
+    // outgoing/incoming split it must land.
+    final backendV2 = Item(
+      id: poisonId,
+      userId: userId,
+      updatedAt: DateTime.now().add(const Duration(minutes: 1)),
+      deleted: false,
+      name: 'Backend v2',
+    );
+    when(mockHttpClient.get(any, headers: anyNamed('headers'))).thenAnswer(
+      (_) async => Response(
+        jsonEncode([backendV2.toJson()]),
+        200,
+        request: Request('GET', Uri()),
+      ),
+    );
 
-  test(
-    'a quarantined row is retried once its version moves on — the quarantine '
-    'is versioned, not permanent',
-    () async {
-      const id = 'versioned-quarantine-id';
-      var poisonRejections = 0;
+    // Drive sync explicitly (as the other pull tests do). Despite the push
+    // staying quarantined, the newer backend version is pulled and written
+    // over the local row — proving the outgoing quarantine doesn't suppress
+    // the incoming pull.
+    await waitForFunctionToPass(() async {
+      await syncManager.syncTables();
+      final row = await (testDb.select(
+        testDb.items,
+      )..where((t) => t.id.equals(poisonId))).getSingle();
+      expect(
+        row.name,
+        'Backend v2',
+        reason: 'incoming pull must not be blocked by the outgoing quarantine',
+      );
+      expect(row.dirty, isFalse, reason: 'pulled row is clean');
+    });
 
-      // The backend rejects the row while its name is still 'Poison'; it accepts
-      // once the row has been edited (the fix). The id-only quarantine would keep
-      // skipping it forever; the versioned quarantine lets the newer edit retry.
-      when(
-        mockHttpClient.post(
-          any,
-          headers: anyNamed('headers'),
-          body: anyNamed('body'),
-        ),
-      ).thenAnswer((inv) async {
-        final body = inv.namedArguments[#body] as String;
-        final rows = (jsonDecode(body) as List).cast<Map<String, dynamic>>();
-        final poisoned = rows.any(
-          (r) => r[idKey] == id && (r['name'] as String?) == 'Poison',
-        );
-        if (poisoned) {
-          poisonRejections++;
-          return Response(
-            jsonEncode({
-              'code': '23505',
-              'message': 'duplicate key value violates unique constraint',
-              'details': null,
-              'hint': null,
-            }),
-            409,
-            request: Request('POST', Uri()),
-            headers: {'content-type': 'application/json; charset=utf-8'},
-          );
-        }
+    syncManager.dispose();
+  });
+
+  test('a quarantined row is retried once its version moves on — the quarantine '
+      'is versioned, not permanent', () async {
+    const id = 'versioned-quarantine-id';
+    var poisonRejections = 0;
+
+    // The backend rejects the row while its name is still 'Poison'; it accepts
+    // once the row has been edited (the fix). The id-only quarantine would keep
+    // skipping it forever; the versioned quarantine lets the newer edit retry.
+    when(
+      mockHttpClient.post(
+        any,
+        headers: anyNamed('headers'),
+        body: anyNamed('body'),
+      ),
+    ).thenAnswer((inv) async {
+      final body = inv.namedArguments[#body] as String;
+      final rows = (jsonDecode(body) as List).cast<Map<String, dynamic>>();
+      final poisoned = rows.any(
+        (r) => r[idKey] == id && (r['name'] as String?) == 'Poison',
+      );
+      if (poisoned) {
+        poisonRejections++;
         return Response(
-          jsonEncode(rows),
-          200,
+          jsonEncode({
+            'code': '23505',
+            'message': 'duplicate key value violates unique constraint',
+            'details': null,
+            'hint': null,
+          }),
+          409,
           request: Request('POST', Uri()),
           headers: {'content-type': 'application/json; charset=utf-8'},
         );
-      });
-
-      final syncManager = SyncManager<TestDatabase>(
-        localDatabase: testDb,
-        supabaseClient: mockSupabaseClient,
-        syncInterval: const Duration(milliseconds: 1),
+      }
+      return Response(
+        jsonEncode(rows),
+        200,
+        request: Request('POST', Uri()),
+        headers: {'content-type': 'application/json; charset=utf-8'},
       );
-      syncManager.registerSyncable<Item>(
-        backendTable: itemsTable,
-        fromJson: Item.fromJson,
-        companionConstructor: ItemsCompanion.new,
-      );
-      final userId = const Uuid().v4();
-      syncManager.enableSync();
-      syncManager.setUserId(userId);
+    });
 
-      // v1: poison — the push is rejected and the row is quarantined at v1.
-      await testDb.into(testDb.items).insert(
-        ItemsCompanion(
-          id: const drift.Value(id),
-          userId: drift.Value(userId),
-          updatedAt: drift.Value(DateTime.now()),
-          deleted: const drift.Value(false),
-          name: const drift.Value('Poison'),
-        ),
-      );
+    final syncManager = SyncManager<TestDatabase>(
+      localDatabase: testDb,
+      supabaseClient: mockSupabaseClient,
+      syncInterval: const Duration(milliseconds: 1),
+    );
+    syncManager.registerSyncable<Item>(
+      backendTable: itemsTable,
+      fromJson: Item.fromJson,
+      companionConstructor: ItemsCompanion.new,
+    );
+    final userId = const Uuid().v4();
+    syncManager.enableSync();
+    syncManager.setUserId(userId);
 
-      // Ensure the poison push was attempted (and thus quarantined) first.
-      await waitForFunctionToPass(() async {
-        expect(poisonRejections, greaterThanOrEqualTo(1));
-      });
-
-      // A local edit (newer updatedAt) that fixes the row. The versioned
-      // quarantine must let this strictly-newer version retry and flush.
-      await (testDb.update(
-        testDb.items,
-      )..where((t) => t.id.equals(id))).write(
-        ItemsCompanion(
-          name: const drift.Value('Fixed'),
-          updatedAt: drift.Value(DateTime.now().add(const Duration(seconds: 1))),
-          dirty: const drift.Value(true),
-        ),
-      );
-
-      await waitForFunctionToPass(() async {
-        final row = await (testDb.select(
-          testDb.items,
-        )..where((t) => t.id.equals(id))).getSingle();
-        expect(
-          row.dirty,
-          isFalse,
-          reason: 'the edited (newer) row retried past quarantine and flushed',
+    // v1: poison — the push is rejected and the row is quarantined at v1.
+    await testDb
+        .into(testDb.items)
+        .insert(
+          ItemsCompanion(
+            id: const drift.Value(id),
+            userId: drift.Value(userId),
+            updatedAt: drift.Value(DateTime.now()),
+            deleted: const drift.Value(false),
+            name: const drift.Value('Poison'),
+          ),
         );
-      });
 
-      syncManager.dispose();
-    },
-  );
+    // Ensure the poison push was attempted (and thus quarantined) first.
+    await waitForFunctionToPass(() async {
+      expect(poisonRejections, greaterThanOrEqualTo(1));
+    });
+
+    // A local edit (newer updatedAt) that fixes the row. The versioned
+    // quarantine must let this strictly-newer version retry and flush.
+    await (testDb.update(testDb.items)..where((t) => t.id.equals(id))).write(
+      ItemsCompanion(
+        name: const drift.Value('Fixed'),
+        updatedAt: drift.Value(DateTime.now().add(const Duration(seconds: 1))),
+        dirty: const drift.Value(true),
+      ),
+    );
+
+    await waitForFunctionToPass(() async {
+      final row = await (testDb.select(
+        testDb.items,
+      )..where((t) => t.id.equals(id))).getSingle();
+      expect(
+        row.dirty,
+        isFalse,
+        reason: 'the edited (newer) row retried past quarantine and flushed',
+      );
+    });
+
+    syncManager.dispose();
+  });
 
   test(
     'Only subscribes to backend changes if other devices are active',
@@ -1089,102 +1089,108 @@ void main() {
   // `syncInterval` makes the distinction observable: if the loop still relied on
   // the timer, these would not finish until 10s; the wake must drain in ~ms.
   group('Event-driven wake (long sync interval)', () {
-    test('A local change wakes the loop and pushes well under the interval', () async {
-      final syncManager = SyncManager(
-        localDatabase: testDb,
-        supabaseClient: mockSupabaseClient,
-        syncInterval: const Duration(seconds: 10),
-      );
-      syncManager.registerSyncable<Item>(
-        backendTable: itemsTable,
-        fromJson: Item.fromJson,
-        companionConstructor: ItemsCompanion.new,
-      );
-      final userId = const Uuid().v4();
-      syncManager.enableSync();
-      syncManager.setUserId(userId);
+    test(
+      'A local change wakes the loop and pushes well under the interval',
+      () async {
+        final syncManager = SyncManager(
+          localDatabase: testDb,
+          supabaseClient: mockSupabaseClient,
+          syncInterval: const Duration(seconds: 10),
+        );
+        syncManager.registerSyncable<Item>(
+          backendTable: itemsTable,
+          fromJson: Item.fromJson,
+          companionConstructor: ItemsCompanion.new,
+        );
+        final userId = const Uuid().v4();
+        syncManager.enableSync();
+        syncManager.setUserId(userId);
 
-      await testDb.into(testDb.items).insert(
-            ItemsCompanion(
-              userId: drift.Value(userId),
-              updatedAt: drift.Value(DateTime.now()),
-              deleted: const drift.Value(false),
-              name: const drift.Value('woken'),
-            ),
-          );
+        await testDb
+            .into(testDb.items)
+            .insert(
+              ItemsCompanion(
+                userId: drift.Value(userId),
+                updatedAt: drift.Value(DateTime.now()),
+                deleted: const drift.Value(false),
+                name: const drift.Value('woken'),
+              ),
+            );
 
-      await waitForFunctionToPass(
-        () async => expect(syncManager.nSyncedToBackend(Item), 1),
-        timeout: const Duration(seconds: 2),
-      );
+        await waitForFunctionToPass(
+          () async => expect(syncManager.nSyncedToBackend(Item), 1),
+          timeout: const Duration(seconds: 2),
+        );
 
-      syncManager.dispose();
-    });
+        syncManager.dispose();
+      },
+    );
 
-    test('A realtime event wakes the loop and writes locally under the interval', () async {
-      void Function(PostgresChangePayload)? pgCallback;
-      when(
-        mockRealtimeChannel.onPostgresChanges(
-          schema: anyNamed('schema'),
-          table: anyNamed('table'),
-          event: anyNamed('event'),
-          callback: anyNamed('callback'),
-        ),
-      ).thenAnswer((inv) {
-        pgCallback =
-            inv.namedArguments[#callback] as void Function(PostgresChangePayload)?;
-        return mockRealtimeChannel;
-      });
+    test(
+      'A realtime event wakes the loop and writes locally under the interval',
+      () async {
+        void Function(PostgresChangePayload)? pgCallback;
+        when(
+          mockRealtimeChannel.onPostgresChanges(
+            schema: anyNamed('schema'),
+            table: anyNamed('table'),
+            event: anyNamed('event'),
+            callback: anyNamed('callback'),
+          ),
+        ).thenAnswer((inv) {
+          pgCallback =
+              inv.namedArguments[#callback]
+                  as void Function(PostgresChangePayload)?;
+          return mockRealtimeChannel;
+        });
 
-      final syncManager = SyncManager(
-        localDatabase: testDb,
-        supabaseClient: mockSupabaseClient,
-        syncInterval: const Duration(seconds: 10),
-      );
-      syncManager.registerSyncable<Item>(
-        backendTable: itemsTable,
-        fromJson: Item.fromJson,
-        companionConstructor: ItemsCompanion.new,
-      );
-      final userId = const Uuid().v4();
-      syncManager.setUserId(userId);
-      syncManager.enableSync();
+        final syncManager = SyncManager(
+          localDatabase: testDb,
+          supabaseClient: mockSupabaseClient,
+          syncInterval: const Duration(seconds: 10),
+        );
+        syncManager.registerSyncable<Item>(
+          backendTable: itemsTable,
+          fromJson: Item.fromJson,
+          companionConstructor: ItemsCompanion.new,
+        );
+        final userId = const Uuid().v4();
+        syncManager.setUserId(userId);
+        syncManager.enableSync();
 
-      // The backend subscription is created once dependencies settle; that is
-      // where our realtime callback gets registered.
-      await waitForFunctionToPass(() async => expect(pgCallback, isNotNull));
+        // The backend subscription is created once dependencies settle; that is
+        // where our realtime callback gets registered.
+        await waitForFunctionToPass(() async => expect(pgCallback, isNotNull));
 
-      final incoming = Item(
-        id: const Uuid().v4(),
-        userId: userId,
-        updatedAt: DateTime.now(),
-        deleted: false,
-        name: 'from-realtime',
-      );
-      pgCallback!(
-        PostgresChangePayload(
-          schema: 'public',
-          table: itemsTable,
-          commitTimestamp: DateTime.now(),
-          eventType: PostgresChangeEvent.insert,
-          newRecord: incoming.toJson(),
-          oldRecord: const {},
-          errors: null,
-        ),
-      );
+        final incoming = Item(
+          id: const Uuid().v4(),
+          userId: userId,
+          updatedAt: DateTime.now(),
+          deleted: false,
+          name: 'from-realtime',
+        );
+        pgCallback!(
+          PostgresChangePayload(
+            schema: 'public',
+            table: itemsTable,
+            commitTimestamp: DateTime.now(),
+            eventType: PostgresChangeEvent.insert,
+            newRecord: incoming.toJson(),
+            oldRecord: const {},
+            errors: null,
+          ),
+        );
 
-      await waitForFunctionToPass(
-        () async {
+        await waitForFunctionToPass(() async {
           final row = await (testDb.select(
             testDb.items,
           )..where((t) => t.id.equals(incoming.id))).getSingleOrNull();
           expect(row?.name, 'from-realtime');
-        },
-        timeout: const Duration(seconds: 2),
-      );
+        }, timeout: const Duration(seconds: 2));
 
-      syncManager.dispose();
-    });
+        syncManager.dispose();
+      },
+    );
 
     test('Rapid successive local changes all push (no missed wakes)', () async {
       final syncManager = SyncManager(
@@ -1206,7 +1212,9 @@ void main() {
       // missed. The `_idle` queue re-check must still drain every one.
       const count = 25;
       for (var i = 0; i < count; i++) {
-        await testDb.into(testDb.items).insert(
+        await testDb
+            .into(testDb.items)
+            .insert(
               ItemsCompanion(
                 userId: drift.Value(userId),
                 updatedAt: drift.Value(DateTime.now()),
@@ -1235,9 +1243,7 @@ void main() {
         mockHttpClient.get(captureAny, headers: anyNamed('headers')),
       ).captured.cast<Uri>();
       // The metadata sweep is the only query selecting `id,updated_at`.
-      return captured
-          .where((u) => u.query.contains('select=id'))
-          .toList();
+      return captured.where((u) => u.query.contains('select=id')).toList();
     }
 
     test('First sweep is full; later sweeps filter on updated_at', () async {
@@ -1275,42 +1281,45 @@ void main() {
       );
     });
 
-    test('Incremental filter is serialized as UTC even if storage is local', () async {
-      // Guards the toUtc() on the watermark: a local DateTime would otherwise
-      // serialize without the 'Z' the backend needs (silent tz mismatch).
-      final syncManager = SyncManager<TestDatabase>(
-        localDatabase: testDb,
-        supabaseClient: mockSupabaseClient,
-        syncInterval: const Duration(milliseconds: 1),
-        syncTimestampStorage: LocalReturningTimestampStorage(),
-      );
-      syncManager.registerSyncable<Item>(
-        backendTable: itemsTable,
-        fromJson: Item.fromJson,
-        companionConstructor: ItemsCompanion.new,
-      );
-
-      syncManager.setUserId(const Uuid().v4());
-      syncManager.enableSync();
-      await syncManager.syncTables();
-      await syncManager.syncTables();
-      syncManager.dispose();
-
-      final gtUris = metadataGetUris()
-          .where((u) => u.query.contains('updated_at=gt.'))
-          .toList();
-      expect(gtUris, isNotEmpty);
-      for (final u in gtUris) {
-        final raw = Uri.decodeComponent(
-          u.query.split('updated_at=gt.')[1].split('&').first,
+    test(
+      'Incremental filter is serialized as UTC even if storage is local',
+      () async {
+        // Guards the toUtc() on the watermark: a local DateTime would otherwise
+        // serialize without the 'Z' the backend needs (silent tz mismatch).
+        final syncManager = SyncManager<TestDatabase>(
+          localDatabase: testDb,
+          supabaseClient: mockSupabaseClient,
+          syncInterval: const Duration(milliseconds: 1),
+          syncTimestampStorage: LocalReturningTimestampStorage(),
         );
-        expect(
-          raw.endsWith('Z'),
-          isTrue,
-          reason: 'incremental filter not UTC-serialized: $raw',
+        syncManager.registerSyncable<Item>(
+          backendTable: itemsTable,
+          fromJson: Item.fromJson,
+          companionConstructor: ItemsCompanion.new,
         );
-      }
-    });
+
+        syncManager.setUserId(const Uuid().v4());
+        syncManager.enableSync();
+        await syncManager.syncTables();
+        await syncManager.syncTables();
+        syncManager.dispose();
+
+        final gtUris = metadataGetUris()
+            .where((u) => u.query.contains('updated_at=gt.'))
+            .toList();
+        expect(gtUris, isNotEmpty);
+        for (final u in gtUris) {
+          final raw = Uri.decodeComponent(
+            u.query.split('updated_at=gt.')[1].split('&').first,
+          );
+          expect(
+            raw.endsWith('Z'),
+            isTrue,
+            reason: 'incremental filter not UTC-serialized: $raw',
+          );
+        }
+      },
+    );
 
     test('Without a timestamp store every sweep stays a full sweep', () async {
       // No syncTimestampStorage → no watermark can be persisted → the filter can
@@ -1335,10 +1344,7 @@ void main() {
 
       final metaUris = metadataGetUris();
       expect(metaUris.length, greaterThanOrEqualTo(2));
-      expect(
-        metaUris.every((u) => !u.query.contains('updated_at=gt')),
-        isTrue,
-      );
+      expect(metaUris.every((u) => !u.query.contains('updated_at=gt')), isTrue);
     });
   });
 
@@ -1367,8 +1373,9 @@ void main() {
     test('A (re)connect forces a reconcile to backfill missed events', () async {
       void Function(RealtimeSubscribeStatus, Object?)? statusCb;
       when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
-        statusCb = inv.positionalArguments.first
-            as void Function(RealtimeSubscribeStatus, Object?)?;
+        statusCb =
+            inv.positionalArguments.first
+                as void Function(RealtimeSubscribeStatus, Object?)?;
         return mockRealtimeChannel;
       });
 
@@ -1401,8 +1408,9 @@ void main() {
       void Function(RealtimeSubscribeStatus, Object?)? statusCb;
       when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
         subscribeCount++;
-        statusCb = inv.positionalArguments.first
-            as void Function(RealtimeSubscribeStatus, Object?)?;
+        statusCb =
+            inv.positionalArguments.first
+                as void Function(RealtimeSubscribeStatus, Object?)?;
         return mockRealtimeChannel;
       });
 
@@ -1427,12 +1435,15 @@ void main() {
       void Function(RealtimeSubscribeStatus, Object?)? statusCb;
       when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
         subscribeCount++;
-        statusCb = inv.positionalArguments.first
-            as void Function(RealtimeSubscribeStatus, Object?)?;
+        statusCb =
+            inv.positionalArguments.first
+                as void Function(RealtimeSubscribeStatus, Object?)?;
         return mockRealtimeChannel;
       });
 
-      final syncManager = buildManager(inactiveAfter: const Duration(seconds: 1));
+      final syncManager = buildManager(
+        inactiveAfter: const Duration(seconds: 1),
+      );
       syncManager.setUserId(const Uuid().v4());
       syncManager.enableSync();
       await waitForFunctionToPass(() async => expect(subscribeCount, 1));

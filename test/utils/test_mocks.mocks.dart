@@ -367,16 +367,28 @@ class MockSupabaseClient extends _i1.Mock implements _i2.SupabaseClient {
 class MockSupabaseQueryBuilder extends _i1.Mock
     implements _i2.SupabaseQueryBuilder {
   @override
-  _i2.SupabaseStreamFilterBuilder stream({required List<String>? primaryKey}) =>
+  _i2.SupabaseStreamFilterBuilder stream({
+    required List<String>? primaryKey,
+    bool? private = false,
+  }) =>
       (super.noSuchMethod(
-            Invocation.method(#stream, [], {#primaryKey: primaryKey}),
+            Invocation.method(#stream, [], {
+              #primaryKey: primaryKey,
+              #private: private,
+            }),
             returnValue: _FakeSupabaseStreamFilterBuilder_9(
               this,
-              Invocation.method(#stream, [], {#primaryKey: primaryKey}),
+              Invocation.method(#stream, [], {
+                #primaryKey: primaryKey,
+                #private: private,
+              }),
             ),
             returnValueForMissingStub: _FakeSupabaseStreamFilterBuilder_9(
               this,
-              Invocation.method(#stream, [], {#primaryKey: primaryKey}),
+              Invocation.method(#stream, [], {
+                #primaryKey: primaryKey,
+                #private: private,
+              }),
             ),
           )
           as _i2.SupabaseStreamFilterBuilder);
