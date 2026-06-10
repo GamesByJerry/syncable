@@ -79,6 +79,11 @@ Check out [the example database](test/utils/test_database.dart) for a complete c
 3. **Create a table to sync to:**
    Make sure to enable real-time and the conflict resolution function for your table.
 
+   > ℹ️ The primary key must be on `id` alone: the sync engine upserts with
+   > `onConflict: id` (one row per entity). A composite key like
+   > `(id, user_id)` cannot satisfy `ON CONFLICT (id)` — Postgres rejects
+   > every upsert with error 42P10.
+
    ```sql
    create table
    items (
@@ -87,7 +92,7 @@ Check out [the example database](test/utils/test_database.dart) for a complete c
        updated_at timestamptz not null,
        deleted boolean not null,
        name text not null,
-       primary key (id, user_id)
+       primary key (id)
    );
 
    create trigger handle_conflicts
@@ -226,6 +231,54 @@ To only sync incremental changes, provide a `SyncTimestampStorage` implementatio
 A straightforward solution is to implement a class that uses
 [SharedPreferences](https://pub.dev/packages/shared_preferences)
 to persist sync timestamps across app restarts.
+
+## End-to-end field encryption 🔐
+
+The sync manager can fold selected content fields of a table into a single
+encrypted blob per row at the push boundary and merge them back at the pull
+boundary, so the backend only ever stores ciphertext for those fields while
+**the local database stays plaintext** (local queries, ordering, and
+filtering keep working). Conflict resolution is unaffected: it runs on the
+plaintext `updated_at` exactly as for unencrypted tables.
+
+The package contains no cryptography. You implement the `SyncFieldCipher`
+contract (AEAD with the binding and failure semantics described in its
+documentation) and pass it to the `SyncManager`, then opt tables in at
+registration:
+
+```dart
+final syncManager = SyncManager(
+  localDatabase: localDatabase,
+  supabaseClient: supabaseClient,
+  fieldCipher: myCipher,
+  onEncryptionAlert: (alert) => report(alert), // tampering vs missing key
+);
+
+syncManager.registerSyncable<SecretItem>(
+  backendTable: 'secret_items',
+  fromJson: SecretItem.fromJson,
+  companionConstructor: SecretItemsCompanion.new,
+  encryption: SyncEncryption(
+    encryptedFields: {'title', 'amount'},
+    lockedFieldPlaceholders: {'title': '🔒', 'amount': 0},
+  ),
+);
+```
+
+Requirements and behavior in brief (see the dartdoc on `SyncFieldCipher`,
+`SyncEncryption`, and `EncryptedSyncable` for the full contract):
+
+- The model/table implement `EncryptedSyncable`/`EncryptedSyncableTable`
+  (three local-only fallback columns), and the backend table carries
+  nullable content columns plus `content_enc` (text) and `key_version` (int)
+  — see [the example migration](supabase/migrations/040_create_secret_items_table.sql).
+- Encryption is scoped per circle (`circle_id` stays plaintext) and resolved
+  per row into one of three modes: `off` (plaintext pass-through), `shadow`
+  (dual-write + parity verification), `enforced` (ciphertext only).
+- Rows that cannot be decrypted are stored **locked** — placeholder content,
+  ciphertext preserved locally — and recovered without a network round-trip
+  via `retryLockedRows()` once key material arrives. A circle can drop back
+  to plaintext with `repushRowsForRestore()`.
 
 ## Contributing 🤝
 
