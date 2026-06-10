@@ -1,3 +1,7 @@
+-- Primary key on id alone: the sync engine upserts with `onConflict: id`
+-- (one row per entity, not per user — GAM-389), which requires a unique
+-- constraint on exactly (id). A composite (id, user_id) key cannot satisfy
+-- `ON CONFLICT (id)` and makes Postgres reject every upsert with 42P10.
 create table
 items (
     id uuid not null,
@@ -5,7 +9,7 @@ items (
     updated_at timestamptz not null,
     deleted boolean not null,
     name text not null,
-    primary key (id, user_id)
+    primary key (id)
 );
 
 create trigger handle_conflicts

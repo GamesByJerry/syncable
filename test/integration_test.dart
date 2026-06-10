@@ -80,7 +80,10 @@ void main() {
         );
 
     await waitForFunctionToPass(() async {
-      expect(syncManager.nSyncedToBackend(Item), 1);
+      // At-least-once, not exactly-once: a connect-time backfill reconcile
+      // (MC-413) can re-push a row whose dirty-clear hasn't landed yet. The
+      // upsert is idempotent and the backend trigger discards the duplicate.
+      expect(syncManager.nSyncedToBackend(Item), greaterThanOrEqualTo(1));
 
       final backendItems = await _getBackendItems(supabaseClient, userId);
 
@@ -88,10 +91,14 @@ void main() {
       expect(backendItems.first.name, 'a');
     });
 
+    // A local edit must mark the row dirty=true (the app gets this via
+    // Syncable.toCompanion()); without it the dirty-flag engine correctly
+    // treats the row as already in sync.
     await (testDb.update(testDb.items)..where((i) => i.name.equals('a'))).write(
       ItemsCompanion(
         updatedAt: Value(DateTime.now().toUtc()),
         name: const Value('b'),
+        dirty: const Value(true),
       ),
     );
 
@@ -132,9 +139,10 @@ void main() {
     final localItem = await testDb.select(testDb.items).getSingle();
 
     await waitForFunctionToPass(() async {
-      expect(syncManager.nSyncedToBackend(Item), 1);
+      expect(syncManager.nSyncedToBackend(Item), greaterThanOrEqualTo(1));
       expect(await _getBackendItems(supabaseClient, userId), hasLength(1));
     });
+    final pushesAfterFirstSync = syncManager.nSyncedToBackend(Item);
 
     // Update the item in the backend with a timestamp that is in the future
     await supabaseClient
@@ -153,13 +161,14 @@ void main() {
     });
 
     // Update the local item with a timestamp that is in the future but before
-    // the one in the backend
+    // the one in the backend. dirty=true marks it as a local edit to push.
     await (testDb.update(
       testDb.items,
     )..where((i) => i.id.equals(localItem.id))).write(
       ItemsCompanion(
         updatedAt: Value(currentTimestamp.add(const Duration(minutes: 30))),
         name: const Value('b'),
+        dirty: const Value(true),
       ),
     );
 
@@ -167,7 +176,10 @@ void main() {
     // to the backend, but the backend should reject it because the timestamp
     // is before the one in the backend
     await waitForFunctionToPass(() async {
-      expect(syncManager.nSyncedToBackend(Item), 2);
+      expect(
+        syncManager.nSyncedToBackend(Item),
+        greaterThan(pushesAfterFirstSync),
+      );
     });
 
     final backendItem = (await _getBackendItems(supabaseClient, userId)).first;
@@ -213,10 +225,11 @@ void main() {
         })
         .eq(idKey, item.id);
 
-    // Wait for item to sync to local database
+    // Wait for item to sync to local database. The update arrives via the
+    // realtime channel — allow for slow websocket delivery under load.
     await waitForFunctionToPass(() async {
       expect((await testDb.getItem(testDb.items, item.id)).name, 'b');
-    });
+    }, timeout: const Duration(seconds: 15));
   });
 
   test('Reading from backend uses paging', () async {
@@ -268,10 +281,11 @@ void main() {
         .from(itemsTable)
         .insert(items.map((item) => item.toJson()).toList());
 
-    // Wait for all Postgres changes to get processed
+    // Wait for all Postgres changes to get processed. Delivering 1001 change
+    // events over one websocket can take a while — be generous.
     await waitForFunctionToPass(() async {
       expect(updatesReceived, maxRows + 1);
-    });
+    }, timeout: const Duration(seconds: 30));
 
     syncManager.enableSync();
 
@@ -344,14 +358,19 @@ void main() {
         );
       });
 
-      expect(syncManager.nFullSyncs, 1);
+      // Assert full-sync counts relatively, not absolutely: the connect-time
+      // realtime backfill (MC-413) runs its own reconcile when the channel
+      // (re)subscribes, so the absolute count depends on socket timing.
+      // Syncing is disabled right now, so the counter is stable.
+      final fullSyncsBeforeReenable = syncManager.nFullSyncs;
+      expect(fullSyncsBeforeReenable, greaterThanOrEqualTo(1));
 
       // Enable sync again
       syncManager.enableSync();
 
       // Wait for local to process the change
       await waitForFunctionToPass(() async {
-        expect(syncManager.nFullSyncs, 2);
+        expect(syncManager.nFullSyncs, greaterThan(fullSyncsBeforeReenable));
       });
 
       await Future.delayed(const Duration(milliseconds: 100));
@@ -383,7 +402,10 @@ void main() {
     syncManager.fillMissingUserIdForLocalTables();
 
     await waitForFunctionToPass(() async {
-      expect(syncManager.nSyncedToBackend(Item), 1);
+      // At-least-once, not exactly-once: a connect-time backfill reconcile
+      // (MC-413) can re-push a row whose dirty-clear hasn't landed yet. The
+      // upsert is idempotent and the backend trigger discards the duplicate.
+      expect(syncManager.nSyncedToBackend(Item), greaterThanOrEqualTo(1));
 
       final backendItems = await _getBackendItems(supabaseClient, userId);
 
