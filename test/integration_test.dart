@@ -360,10 +360,10 @@ void main() {
 
       // Assert full-sync counts relatively, not absolutely: the connect-time
       // realtime backfill (MC-413) runs its own reconcile when the channel
-      // (re)subscribes, so the absolute count depends on socket timing.
+      // (re)subscribes, and the count can even still be zero here when the
+      // realtime insert above landed before the initial reconcile finished.
       // Syncing is disabled right now, so the counter is stable.
       final fullSyncsBeforeReenable = syncManager.nFullSyncs;
-      expect(fullSyncsBeforeReenable, greaterThanOrEqualTo(1));
 
       // Enable sync again
       syncManager.enableSync();

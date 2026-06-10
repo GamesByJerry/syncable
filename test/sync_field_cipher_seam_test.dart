@@ -16,6 +16,20 @@ import 'utils/test_mocks.mocks.dart';
 import 'utils/test_supabase_names.dart';
 import 'utils/wait_for_function_to_pass.dart';
 
+class _MemoryTimestampStorage extends SyncTimestampStorage {
+  final Map<String, DateTime> _timestamps = {};
+
+  @override
+  Future<void> setSyncTimestamp(String key, DateTime timestamp) async {
+    _timestamps[key] = timestamp;
+  }
+
+  @override
+  DateTime? getSyncTimestamp(String key) {
+    return _timestamps[key];
+  }
+}
+
 /// MC-427: the field-cipher codec seam at the Syncable push/pull boundary.
 ///
 /// Content fields of registered tables are folded into one AEAD blob per row
@@ -401,6 +415,91 @@ void main() {
       expect((await localRow(item.id)).dirty, isFalse);
 
       syncManager.dispose();
+    });
+
+    test('a deferred push survives a restart even when the persisted push '
+        'watermark moved past it: retryLockedRows re-enqueues from the '
+        'database, not the in-memory deferral map', () async {
+      // The failure mode (Codex review on PR #8): row A is deferred for a
+      // missing key; row B pushes successfully afterwards, advancing the
+      // PERSISTED last-pushed watermark beyond A's updatedAt. After a
+      // restart the deferral map is gone and the local-change sweep filters
+      // A out (updatedAt <= watermark), so without DB-driven recovery the
+      // row would stay dirty-but-unpushed forever.
+      final timestamps = _MemoryTimestampStorage();
+      final cipher = FakeFieldCipher()
+        ..circleModes[circleId] = SyncEncryptionMode.enforced; // no key yet
+      final alerts = <SyncEncryptionAlert>[];
+
+      SyncManager<TestDatabase> build() {
+        final manager = SyncManager<TestDatabase>(
+          localDatabase: testDb,
+          supabaseClient: mockSupabaseClient,
+          syncInterval: const Duration(milliseconds: 1),
+          syncTimestampStorage: timestamps,
+          fieldCipher: cipher,
+          onEncryptionAlert: alerts.add,
+        );
+        manager.registerSyncable<SecretItem>(
+          backendTable: secretItemsTable,
+          fromJson: SecretItem.fromJson,
+          companionConstructor: SecretItemsCompanion.new,
+          encryption: secretItemsEncryption(),
+        );
+        return manager;
+      }
+
+      final userId = const Uuid().v4();
+      final firstRun = build();
+      firstRun.enableSync();
+      firstRun.setUserId(userId);
+
+      // Row A: enforced circle without a key — push deferred.
+      final itemA = await insertLocal(
+        userId: userId,
+        title: 'deferred secret',
+        updatedAt: DateTime.now().toUtc(),
+      );
+      await waitForFunctionToPass(() async {
+        expect(
+          alerts.where((a) => a.kind == SyncEncryptionAlertKind.keyUnavailable),
+          isNotEmpty,
+        );
+      });
+
+      // Row B: a circle in off mode — pushes fine and advances the
+      // persisted watermark past row A's updatedAt.
+      final otherCircle = const Uuid().v4();
+      await insertLocal(
+        userId: userId,
+        circle: otherCircle,
+        title: 'plain row',
+        updatedAt: DateTime.now().toUtc().add(const Duration(seconds: 1)),
+      );
+      await waitForFunctionToPass(() async {
+        expect(firstRun.nSyncedToBackend(SecretItem), 1);
+      });
+
+      // "Restart": fresh manager, same database + persisted timestamps.
+      firstRun.dispose();
+      cipher.keys[circleId] = {1}; // the key arrived while we were away
+      final secondRun = build();
+      secondRun.enableSync();
+      secondRun.setUserId(userId);
+
+      // The app's key bootstrap calls this after sign-in / key arrival.
+      await secondRun.retryLockedRows();
+
+      await waitForFunctionToPass(() async {
+        final row = await localRow(itemA.id);
+        expect(row.dirty, isFalse, reason: 'deferred row finally pushed');
+      });
+      final pushedA = pushedRows().where((r) => r[idKey] == itemA.id).toList();
+      expect(pushedA, isNotEmpty);
+      expect(pushedA.last[contentEncKey], isNotNull);
+      expect(pushedA.last[titleKey], isNull);
+
+      secondRun.dispose();
     });
   });
 

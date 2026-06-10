@@ -567,9 +567,13 @@ class SyncManager<T extends SyncableDatabase> {
   }
 
   /// Re-attempts decryption of every locked row from its locally preserved
-  /// ciphertext, and re-enqueues pushes that were deferred for a missing
-  /// circle key. Call this whenever new key material lands (e.g. a circle key
-  /// wrap arrives for this user). No network round-trip is involved — the
+  /// ciphertext, and re-enqueues every dirty row of encrypted tables whose
+  /// push may have been deferred for a missing circle key. Call this whenever
+  /// new key material lands (a circle key wrap arrives for this user) AND
+  /// once after sign-in/key bootstrap on startup: deferral state is
+  /// in-memory, and a deferred row's `updatedAt` may sit behind the persisted
+  /// push watermark, so the regular local-change sweep alone would never
+  /// retry it. No network round-trip is involved in unlocking — the
   /// ciphertext was preserved exactly for this moment.
   ///
   /// Unlocking is not a local edit: the row's `updatedAt` and `dirty` flag are
@@ -660,15 +664,30 @@ class SyncManager<T extends SyncableDatabase> {
     }
 
     // New key material may also unblock pushes deferred in enforced mode.
+    // Re-enqueue from the DATABASE, not the in-memory deferral map: deferral
+    // state does not survive a restart, but the rows stay persistently dirty
+    // — and the persisted push watermark may have advanced past their
+    // updatedAt (any later successful push does that), in which case the
+    // normal local-change sweep would filter them out forever. Enqueueing
+    // directly bypasses that filter; pushes are idempotent upserts, so
+    // re-enqueueing a dirty row that was about to push anyway is harmless.
     var reenqueued = false;
     for (final syncable in _syncables) {
-      final deferred = _encryptionDeferred[syncable];
-      if (deferred == null || deferred.isEmpty) continue;
+      if (_encryption[syncable] == null) continue;
+      _encryptionDeferred[syncable]!.clear();
+
+      final table = _localTables[syncable]!;
+      final dirtyColumn =
+          table.columnsByName['dirty']! as GeneratedColumn<bool>;
+      final dirtyRows = await (_localDb.select(
+        table,
+      )..where((_) => dirtyColumn.equals(true))).get();
+      if (dirtyRows.isEmpty) continue;
+
       final outQueue = _outQueues[syncable]!;
-      for (final row in deferred.values) {
+      for (final row in dirtyRows) {
         outQueue[row.id] = row;
       }
-      deferred.clear();
       reenqueued = true;
     }
     if (reenqueued) _wake();
@@ -698,9 +717,17 @@ class SyncManager<T extends SyncableDatabase> {
       if (_encryption[syncable] == null) continue;
       final table = _localTables[syncable]!;
 
-      final rows = await _localDb.select(table).get();
+      // Filter by circle in SQL so only the circle's rows are loaded, not the
+      // whole table. A registered table without a circle_id column cannot
+      // hold circle-scoped rows at all.
+      final circleIdColumn =
+          table.columnsByName[circleIdKey] as GeneratedColumn<String>?;
+      if (circleIdColumn == null) continue;
+
+      final rows = await (_localDb.select(
+        table,
+      )..where((_) => circleIdColumn.equals(circleId))).get();
       for (final row in rows) {
-        if (row.toJson()[circleIdKey] != circleId) continue;
         if (row is EncryptedSyncable && row.locked) {
           _logger.warning(
             'Skipping locked row ${row.id} of ${_backendTables[syncable]} '
@@ -992,11 +1019,13 @@ class SyncManager<T extends SyncableDatabase> {
           // GAM-389: no user_id filter — pull whatever RLS permits.
           .inFilter(idKey, batch);
 
-      // Decode each wire row (decrypting registered content); _enqueueIncoming
+      // Decode the wire rows (decrypting registered content) concurrently —
+      // ids within a batch are unique, so completion order cannot reorder
+      // versions of a row. _enqueueIncoming contains per-row failures and
       // wakes the loop so an off-loop reconcile's finds get written promptly.
-      for (final wireRow in pulledBatch) {
-        await _enqueueIncoming(syncable, wireRow);
-      }
+      await Future.wait(
+        pulledBatch.map((wireRow) => _enqueueIncoming(syncable, wireRow)),
+      );
     }
 
     await _updateLastPulledTimeStamp(syncable, pullStartedAt);
@@ -1401,14 +1430,21 @@ class SyncManager<T extends SyncableDatabase> {
 
       assert(!outgoing.any((s) => s.userId?.isEmpty ?? true));
 
-      // Encode rows for the wire (the field-encryption seam): fold registered
-      // content fields into the blob according to the circle's mode. Rows that
-      // cannot be encrypted yet (missing circle key in enforced mode) are
-      // deferred — withheld from the wire, never dropped.
+      // Encode rows for the wire (the field-encryption seam) concurrently:
+      // fold registered content fields into the blob according to the
+      // circle's mode. Rows that cannot be encrypted yet (missing circle key
+      // in enforced mode) are deferred — withheld from the wire, never
+      // dropped.
       final encoded = <Syncable, Map<String, dynamic>>{};
-      for (final row in outgoing) {
-        final payload = await _encodeOutgoing(syncable, row);
-        if (payload != null) encoded[row] = payload;
+      final encodeResults = await Future.wait(
+        outgoing.map(
+          (row) async =>
+              (row: row, payload: await _encodeOutgoing(syncable, row)),
+        ),
+      );
+      for (final result in encodeResults) {
+        final payload = result.payload;
+        if (payload != null) encoded[result.row] = payload;
       }
 
       if (encoded.isEmpty) continue;
