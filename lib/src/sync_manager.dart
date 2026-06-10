@@ -4,7 +4,9 @@ import 'package:collection/collection.dart';
 import 'package:drift/drift.dart';
 import 'package:logging/logging.dart';
 import 'package:supabase/supabase.dart';
+import 'package:syncable/src/encrypted_syncable.dart';
 import 'package:syncable/src/supabase_names.dart';
+import 'package:syncable/src/sync_field_cipher.dart';
 import 'package:syncable/src/sync_timestamp_storage.dart';
 import 'package:syncable/src/syncable.dart';
 import 'package:syncable/src/syncable_database.dart';
@@ -57,6 +59,14 @@ class SyncManager<T extends SyncableDatabase> {
   /// between devices and rows written during the previous pull so none are
   /// missed. Requires a [syncTimestampStorage]; without one every reconcile
   /// falls back to a full sweep.
+  ///
+  /// The [fieldCipher] parameter enables the field-encryption seam: tables
+  /// registered with a [SyncEncryption] config have their content fields
+  /// folded into one encrypted blob per row at the push boundary and merged
+  /// back at the pull boundary (the local database stays plaintext). The
+  /// [onEncryptionAlert] callback receives encryption events the app should
+  /// report — severities split tampering (critical) from key availability
+  /// (info); see [SyncEncryptionAlert].
   SyncManager({
     required T localDatabase,
     required SupabaseClient supabaseClient,
@@ -65,6 +75,8 @@ class SyncManager<T extends SyncableDatabase> {
     SyncTimestampStorage? syncTimestampStorage,
     Duration otherDevicesConsideredInactiveAfter = const Duration(minutes: 2),
     Duration reconcileOverlap = const Duration(seconds: 10),
+    SyncFieldCipher? fieldCipher,
+    void Function(SyncEncryptionAlert alert)? onEncryptionAlert,
   }) : _localDb = localDatabase,
        _supabaseClient = supabaseClient,
        _syncInterval = syncInterval,
@@ -72,6 +84,8 @@ class SyncManager<T extends SyncableDatabase> {
        _syncTimestampStorage = syncTimestampStorage,
        _devicesConsideredInactiveAfter = otherDevicesConsideredInactiveAfter,
        _reconcileOverlap = reconcileOverlap,
+       _fieldCipher = fieldCipher,
+       _onEncryptionAlert = onEncryptionAlert,
        assert(
          syncInterval.inMilliseconds > 0,
          'Sync interval must be positive',
@@ -86,6 +100,8 @@ class SyncManager<T extends SyncableDatabase> {
   final int _maxRows;
   final Duration _devicesConsideredInactiveAfter;
   final Duration _reconcileOverlap;
+  final SyncFieldCipher? _fieldCipher;
+  final void Function(SyncEncryptionAlert alert)? _onEncryptionAlert;
 
   /// This is what gets set when [enableSync] gets called. Internally, whether
   /// the syncing is enabled or not is determined by [_syncingEnabled].
@@ -202,6 +218,26 @@ class SyncManager<T extends SyncableDatabase> {
   final Map<Type, Map<String, DateTime>> _outgoingQuarantined = {};
   final Map<Type, Map<String, DateTime>> _incomingQuarantined = {};
 
+  /// Field-encryption registration per syncable (only set for tables that
+  /// participate in the seam).
+  final Map<Type, SyncEncryption> _encryption = {};
+
+  /// Locked-blob instructions produced at the pull *decode* boundary, consumed
+  /// at *write* time: a row that arrived undecryptable decodes into a
+  /// placeholder model (the queues only carry [Syncable]s), and the verbatim
+  /// ciphertext travels alongside in this sidecar, keyed by row id, to be
+  /// written into the table's locked-row fallback columns together with the
+  /// row. Entries are versioned on the row's `updatedAt` so a stale
+  /// instruction is never applied to a different version's write.
+  final Map<Type, Map<String, _PendingLockedBlob>> _pendingLockedBlobs = {};
+
+  /// Rows whose push is deferred because the circle key needed to encrypt them
+  /// is not available (enforced mode only). Kept out of the out-queue so they
+  /// don't spin/alert every loop pass; re-enqueued by [retryLockedRows] when
+  /// new key material arrives, by a newer local edit, or by a restart (rows
+  /// stay dirty in the local db, so nothing is lost).
+  final Map<Type, Map<String, Syncable>> _encryptionDeferred = {};
+
   final Map<Type, StreamSubscription<List<Syncable>>> _localSubscriptions = {};
 
   RealtimeChannel? _backendSubscription;
@@ -248,12 +284,19 @@ class SyncManager<T extends SyncableDatabase> {
   /// [companionConstructor] parameter is then used create a companion object
   /// from the [Syncable] object to write it to the local database.
   ///
+  /// The [encryption] parameter opts the table into the field-encryption
+  /// seam (requires a [SyncFieldCipher] on the manager): the registered
+  /// content fields are folded into one encrypted blob per row on push and
+  /// merged back on pull. See [SyncEncryption] for the requirements on the
+  /// model, the table, and the backend schema.
+  ///
   /// The generic type parameter must be provided and must be a  concrete
   /// subclass of [Syncable].
   void registerSyncable<S extends Syncable>({
     required String backendTable,
     required Syncable Function(Map<String, dynamic>) fromJson,
     required CompanionConstructor companionConstructor,
+    SyncEncryption? encryption,
   }) {
     if (S == Syncable) {
       throw Exception(
@@ -270,17 +313,101 @@ class SyncManager<T extends SyncableDatabase> {
 
     if (_syncables.contains(S)) return;
 
+    final table = _localDb.getTable<S>();
+    if (encryption != null) {
+      _validateEncryptionRegistration<S>(
+        backendTable: backendTable,
+        encryption: encryption,
+        table: table,
+        companionConstructor: companionConstructor,
+      );
+    }
+
     _syncables.add(S);
-    _localTables[S] = _localDb.getTable<S>();
+    _localTables[S] = table;
     _backendTables[S] = backendTable;
     _fromJsons[S] = fromJson;
     _companions[S] = companionConstructor;
+    if (encryption != null) _encryption[S] = encryption;
     _inQueues[S] = {};
     _outQueues[S] = {};
     _sentItems[S] = {};
     _receivedItems[S] = {};
     _outgoingQuarantined[S] = {};
     _incomingQuarantined[S] = {};
+    _pendingLockedBlobs[S] = {};
+    _encryptionDeferred[S] = {};
+  }
+
+  /// Wire keys that the sync engine, RLS, or the backend itself must be able
+  /// to read — they can never be folded into the encrypted blob. (The rule:
+  /// anything sync/RLS needs to filter, order, join, or upsert on stays
+  /// plaintext; everything else is content.)
+  static const Set<String> _protectedWireKeys = {
+    idKey,
+    userIdKey,
+    updatedAtKey,
+    deletedKey,
+    circleIdKey,
+    contentEncKey,
+    keyVersionKey,
+  };
+
+  void _validateEncryptionRegistration<S extends Syncable>({
+    required String backendTable,
+    required SyncEncryption encryption,
+    required TableInfo<SyncableTable, S> table,
+    required CompanionConstructor companionConstructor,
+  }) {
+    if (_fieldCipher == null) {
+      throw Exception(
+        'Cannot register encryption for $backendTable: no SyncFieldCipher was '
+        'provided to the SyncManager',
+      );
+    }
+    if (encryption.encryptedFields.isEmpty) {
+      throw Exception(
+        'Cannot register encryption for $backendTable with an empty '
+        'encrypted-field set',
+      );
+    }
+    final protected = encryption.encryptedFields.intersection(
+      _protectedWireKeys,
+    );
+    if (protected.isNotEmpty) {
+      throw Exception(
+        'Cannot encrypt $protected of $backendTable: sync, RLS, or the seam '
+        'itself depends on these staying plaintext',
+      );
+    }
+    final orphanPlaceholders = encryption.lockedFieldPlaceholders.keys
+        .toSet()
+        .difference(encryption.encryptedFields);
+    if (orphanPlaceholders.isNotEmpty) {
+      throw Exception(
+        'Locked-field placeholders $orphanPlaceholders of $backendTable do '
+        'not match any registered encrypted field',
+      );
+    }
+    final missingColumns = [
+      'locked',
+      'locked_content_enc',
+      'locked_key_version',
+    ].where((c) => !table.columnsByName.containsKey(c)).toList();
+    if (missingColumns.isNotEmpty) {
+      throw Exception(
+        'Cannot register encryption for $backendTable: the local table is '
+        'missing the locked-row fallback column(s) $missingColumns — '
+        'implement EncryptedSyncableTable',
+      );
+    }
+    if (companionConstructor is! EncryptedCompanionConstructor) {
+      throw Exception(
+        'Cannot register encryption for $backendTable: the companion '
+        'constructor does not accept the locked-row columns — does the table '
+        'implement EncryptedSyncableTable?',
+      );
+    }
   }
 
   Future<void> _startLoop() async {
@@ -439,6 +566,169 @@ class SyncManager<T extends SyncableDatabase> {
     return removed;
   }
 
+  /// Re-attempts decryption of every locked row from its locally preserved
+  /// ciphertext, and re-enqueues pushes that were deferred for a missing
+  /// circle key. Call this whenever new key material lands (e.g. a circle key
+  /// wrap arrives for this user). No network round-trip is involved — the
+  /// ciphertext was preserved exactly for this moment.
+  ///
+  /// Unlocking is not a local edit: the row's `updatedAt` and `dirty` flag are
+  /// left as they were, so an unlock never causes a push and never disturbs
+  /// conflict resolution. Rows whose key is still missing stay locked
+  /// silently; rows whose blob fails authentication stay locked and are
+  /// reported as possible tampering.
+  ///
+  /// Returns the number of rows unlocked.
+  Future<int> retryLockedRows() async {
+    final cipher = _fieldCipher;
+    if (cipher == null) return 0;
+
+    var unlocked = 0;
+
+    for (final syncable in _syncables) {
+      final encryption = _encryption[syncable];
+      if (encryption == null) continue;
+
+      final table = _localTables[syncable]!;
+      final backendTable = _backendTables[syncable]!;
+      final lockedColumn =
+          table.columnsByName['locked']! as GeneratedColumn<bool>;
+
+      final lockedRows = await (_localDb.select(
+        table,
+      )..where((_) => lockedColumn.equals(true))).get();
+
+      for (final row in lockedRows) {
+        final lockedRow = row as EncryptedSyncable;
+        final contentEnc = lockedRow.lockedContentEnc;
+        final keyVersion = lockedRow.lockedKeyVersion;
+        final json = row.toJson();
+        final circleId = json[circleIdKey] as String?;
+        if (contentEnc == null || keyVersion == null || circleId == null) {
+          continue;
+        }
+
+        try {
+          final fields = await cipher.decryptContent(
+            table: backendTable,
+            rowId: row.id,
+            circleId: circleId,
+            contentEnc: contentEnc,
+            keyVersion: keyVersion,
+          );
+          fields.removeWhere((key, _) => _protectedWireKeys.contains(key));
+          json.addAll(fields);
+          final item = _fromJsons[syncable]!(json);
+
+          await _localDb.transaction(() async {
+            // The decoded model carries the real content plus cleared locked
+            // state; its companion rewrites the row in place.
+            await (_localDb.update(
+              table,
+            )..where((tbl) => tbl.id.equals(row.id))).write(item.toCompanion());
+            // toCompanion defaults dirty=true. Restore the row's original
+            // flag: an unlock is not a local edit (no re-push), but a pending
+            // local write (e.g. a tombstone) must survive the unlock.
+            final dirtyCompanion =
+                _companions[syncable]!(dirty: Value(row.dirty))
+                    as UpdateCompanion<Syncable>;
+            await (_localDb.update(
+              table,
+            )..where((tbl) => tbl.id.equals(row.id))).write(dirtyCompanion);
+          });
+          unlocked++;
+        } on SyncCipherMissingKeyException {
+          _logger.fine(
+            'Row ${row.id} in $backendTable stays locked '
+            '(key v$keyVersion still unavailable)',
+          );
+        } on SyncCipherAuthException catch (e) {
+          _emitAlert(
+            SyncEncryptionAlert(
+              kind: SyncEncryptionAlertKind.possibleTampering,
+              severity: SyncEncryptionAlertSeverity.critical,
+              table: backendTable,
+              rowId: row.id,
+              circleId: circleId,
+              keyVersion: keyVersion,
+              message:
+                  'Preserved blob failed authentication on unlock retry: $e',
+            ),
+          );
+        }
+      }
+    }
+
+    // New key material may also unblock pushes deferred in enforced mode.
+    var reenqueued = false;
+    for (final syncable in _syncables) {
+      final deferred = _encryptionDeferred[syncable];
+      if (deferred == null || deferred.isEmpty) continue;
+      final outQueue = _outQueues[syncable]!;
+      for (final row in deferred.values) {
+        outQueue[row.id] = row;
+      }
+      deferred.clear();
+      reenqueued = true;
+    }
+    if (reenqueued) _wake();
+
+    if (unlocked > 0) {
+      _logger.info('Unlocked $unlocked locked row(s) after key arrival');
+    }
+    return unlocked;
+  }
+
+  /// Marks every non-locked row of [circleId] in encryption-registered tables
+  /// for re-push — the decrypt-and-restore direction: with the circle's mode
+  /// resolved back to [SyncEncryptionMode.off] (do that BEFORE calling), the
+  /// re-pushes rewrite the backend's plaintext columns from the locally
+  /// decrypted copies and null the blob columns, dropping the circle back out
+  /// of encryption.
+  ///
+  /// Each row's `updatedAt` is bumped (backends reject non-newer writes), so
+  /// other devices re-pull the circle afterwards. Locked rows are skipped —
+  /// this device cannot restore content it could never read; run
+  /// [retryLockedRows] first if the key arrived late.
+  ///
+  /// Returns the number of rows marked for re-push.
+  Future<int> repushRowsForRestore({required String circleId}) async {
+    var marked = 0;
+    for (final syncable in _syncables) {
+      if (_encryption[syncable] == null) continue;
+      final table = _localTables[syncable]!;
+
+      final rows = await _localDb.select(table).get();
+      for (final row in rows) {
+        if (row.toJson()[circleIdKey] != circleId) continue;
+        if (row is EncryptedSyncable && row.locked) {
+          _logger.warning(
+            'Skipping locked row ${row.id} of ${_backendTables[syncable]} '
+            'during restore of circle $circleId — its content was never '
+            'decryptable on this device',
+          );
+          continue;
+        }
+        final companion =
+            _companions[syncable]!(
+                  dirty: const Value(true),
+                  updatedAt: Value(DateTime.now().toUtc()),
+                )
+                as UpdateCompanion<Syncable>;
+        await (_localDb.update(
+          table,
+        )..where((tbl) => tbl.id.equals(row.id))).write(companion);
+        marked++;
+      }
+    }
+    if (marked > 0) {
+      _logger.info(
+        'Marked $marked row(s) of circle $circleId for plaintext restore',
+      );
+    }
+    return marked;
+  }
+
   Future _onDependenciesChanged(String reason) async {
     _maybeSubscribeToLocalChanges();
     _maybeSubscribeToBackendChanges();
@@ -549,11 +839,10 @@ class SyncManager<T extends SyncableDatabase> {
         callback: (p) {
           if (_disposed) return;
           if (p.newRecord.isNotEmpty) {
-            final item = _fromJsons[syncable]!(p.newRecord);
-            _inQueues[syncable]!.add(item);
-            // Drain the realtime delivery now rather than on the next backstop
-            // tick — this is the reader-side half of the sub-second path.
-            _wake();
+            // Decode (and, for encrypted tables, decrypt) off the callback;
+            // _enqueueIncoming wakes the loop once the item is queued — the
+            // reader-side half of the sub-second path.
+            unawaited(_enqueueIncoming(syncable, p.newRecord));
           }
         },
         // GAM-389: no user_id filter — Postgres Changes only delivers rows the
@@ -701,12 +990,13 @@ class SyncManager<T extends SyncableDatabase> {
           .from(_backendTables[syncable]!)
           .select()
           // GAM-389: no user_id filter — pull whatever RLS permits.
-          .inFilter(idKey, batch)
-          .then((data) => data.map(_fromJsons[syncable]!));
+          .inFilter(idKey, batch);
 
-      _inQueues[syncable]!.addAll(pulledBatch);
-      // A reconcile (off-loop) found rows to pull — wake the loop to write them.
-      _wake();
+      // Decode each wire row (decrypting registered content); _enqueueIncoming
+      // wakes the loop so an off-loop reconcile's finds get written promptly.
+      for (final wireRow in pulledBatch) {
+        await _enqueueIncoming(syncable, wireRow);
+      }
     }
 
     await _updateLastPulledTimeStamp(syncable, pullStartedAt);
@@ -798,6 +1088,278 @@ class SyncManager<T extends SyncableDatabase> {
         .map((backendItem) => backendItem[idKey]! as String);
   }
 
+  /// Decodes a backend wire row (the pull half of the encryption seam) and
+  /// enqueues it for the local write. Decode failures are contained per row so
+  /// one malformed row cannot take down a realtime callback or a whole batch.
+  Future<void> _enqueueIncoming(
+    Type syncable,
+    Map<String, dynamic> wireRow,
+  ) async {
+    final Syncable item;
+    try {
+      item = await _decodeIncoming(syncable, wireRow);
+    } catch (e, s) {
+      // coverage:ignore-start
+      _logger.severe(
+        'Failed to decode incoming row for table '
+        '${_backendTables[syncable]}: $e\n$s',
+      );
+      return;
+      // coverage:ignore-end
+    }
+    if (_disposed) return;
+    _inQueues[syncable]!.add(item);
+    _wake();
+  }
+
+  /// Turns a backend wire row into a [Syncable] — for encrypted tables this is
+  /// where the blob is decrypted and the content fields merged back before
+  /// `fromJson`. Conflict resolution never sees ciphertext: it runs on the
+  /// decoded item's plaintext `updatedAt` afterwards, exactly as for
+  /// unencrypted tables.
+  ///
+  /// Rows whose content cannot be decrypted (missing key, unknown version,
+  /// failed authentication) decode into *locked* placeholder rows and the
+  /// verbatim ciphertext is preserved — never discarded: the local cache is
+  /// plaintext-only and the row's updated_at watermark means a pull would
+  /// never re-fetch it, so dropping the blob would lose the content forever.
+  /// Missing keys alert at info severity, authentication failures at critical
+  /// (possible tampering); storage handling is identical for both.
+  Future<Syncable> _decodeIncoming(
+    Type syncable,
+    Map<String, dynamic> wireRow,
+  ) async {
+    final encryption = _encryption[syncable];
+    if (encryption == null) return _fromJsons[syncable]!(wireRow);
+
+    // Never mutate the caller's map (realtime payloads are not ours).
+    final json = Map<String, dynamic>.from(wireRow);
+    final contentEnc = json.remove(contentEncKey) as String?;
+    final keyVersion = (json.remove(keyVersionKey) as num?)?.toInt();
+
+    if (contentEnc == null) {
+      // Legacy plaintext row, or an off-mode circle: pass through. This
+      // mixed-state read path stays until the GA plaintext decommission.
+      return _fromJsons[syncable]!(json);
+    }
+
+    final backendTable = _backendTables[syncable]!;
+    final rowId = json[idKey] as String;
+    final circleId = json[circleIdKey] as String?;
+
+    // A row is "enforced-shaped" when its registered plaintext columns are all
+    // nulled — the blob is then the only copy of the content. Rows that still
+    // carry plaintext (shadow dual-writes, restored rows with a stale blob,
+    // mid-transition rows) stay readable no matter what happens to the blob:
+    // a readable row is never locked.
+    final enforcedShaped = encryption.encryptedFields.every(
+      (field) => json[field] == null,
+    );
+
+    if (circleId == null || keyVersion == null) {
+      // Without a circle scope or a key version no key can be selected.
+      // Likely a backend data bug rather than tampering: key-availability
+      // severity, not critical.
+      if (!enforcedShaped) return _fromJsons[syncable]!(json);
+      _emitAlert(
+        SyncEncryptionAlert(
+          kind: SyncEncryptionAlertKind.keyUnavailable,
+          severity: SyncEncryptionAlertSeverity.info,
+          table: backendTable,
+          rowId: rowId,
+          circleId: circleId,
+          keyVersion: keyVersion,
+          message:
+              'Encrypted row carries no '
+              '${circleId == null ? 'circle_id' : 'key_version'} — cannot '
+              'select a key; row stored locked',
+        ),
+      );
+      return _lockRow(syncable, json, contentEnc, keyVersion);
+    }
+
+    final mode = await _fieldCipher!.modeFor(
+      table: backendTable,
+      circleId: circleId,
+    );
+
+    if (!enforcedShaped && mode != SyncEncryptionMode.enforced) {
+      // Plaintext-authoritative row. In shadow mode the blob must still agree
+      // with the plaintext — that parity check is what proves the pipeline
+      // lossless before a circle is promoted.
+      if (mode == SyncEncryptionMode.shadow) {
+        await _verifyShadowParity(
+          syncable,
+          json,
+          contentEnc: contentEnc,
+          keyVersion: keyVersion,
+          circleId: circleId,
+        );
+      }
+      return _fromJsons[syncable]!(json);
+    }
+
+    // Blob-authoritative: enforced mode, or an enforced-shaped row pulled
+    // while this client still resolves the circle as shadow/off (mode
+    // transition skew — the row's shape wins, there is no plaintext to read).
+    try {
+      final fields = await _fieldCipher.decryptContent(
+        table: backendTable,
+        rowId: rowId,
+        circleId: circleId,
+        contentEnc: contentEnc,
+        keyVersion: keyVersion,
+      );
+      // The blob can only ever contribute content: a crafted blob (someone
+      // with the circle key) must not be able to spoof the plaintext envelope
+      // the sync engine trusts (LWW timestamp, identity, tombstone, scope).
+      fields.removeWhere((key, _) => _protectedWireKeys.contains(key));
+      // Unknown fields from newer clients flow through (`fromJson` ignores
+      // them) — blob evolution is the cipher's job, tolerance is ours.
+      json.addAll(fields);
+      return _fromJsons[syncable]!(json);
+    } on SyncCipherMissingKeyException catch (e) {
+      if (!enforcedShaped) return _fromJsons[syncable]!(json);
+      _emitAlert(
+        SyncEncryptionAlert(
+          kind: SyncEncryptionAlertKind.keyUnavailable,
+          severity: SyncEncryptionAlertSeverity.info,
+          table: backendTable,
+          rowId: rowId,
+          circleId: circleId,
+          keyVersion: keyVersion,
+          message: 'Row stored locked until its key arrives: $e',
+        ),
+      );
+      return _lockRow(syncable, json, contentEnc, keyVersion);
+    } on SyncCipherAuthException catch (e) {
+      _emitAlert(
+        SyncEncryptionAlert(
+          kind: SyncEncryptionAlertKind.possibleTampering,
+          severity: SyncEncryptionAlertSeverity.critical,
+          table: backendTable,
+          rowId: rowId,
+          circleId: circleId,
+          keyVersion: keyVersion,
+          message: 'Blob failed authentication (tampered or transplanted): $e',
+        ),
+      );
+      if (!enforcedShaped) return _fromJsons[syncable]!(json);
+      return _lockRow(syncable, json, contentEnc, keyVersion);
+    }
+  }
+
+  /// Decodes an undecryptable row into a locked placeholder model and stashes
+  /// the verbatim ciphertext for the write path (and later local retry).
+  Syncable _lockRow(
+    Type syncable,
+    Map<String, dynamic> json,
+    String contentEnc,
+    int? keyVersion,
+  ) {
+    final encryption = _encryption[syncable]!;
+    for (final field in encryption.encryptedFields) {
+      json[field] = encryption.lockedFieldPlaceholders[field];
+    }
+    final item = _fromJsons[syncable]!(json);
+    _pendingLockedBlobs[syncable]![item.id] = _PendingLockedBlob(
+      contentEnc: contentEnc,
+      keyVersion: keyVersion,
+      forUpdatedAt: item.updatedAt,
+    );
+    return item;
+  }
+
+  /// Shadow-mode parity check: the decrypted blob must agree with the
+  /// authoritative plaintext columns. Mismatches are reported (field names
+  /// only — never values); a missing key just skips verification (key
+  /// telemetry is not the pull path's job), a failed authentication is
+  /// reported as possible tampering.
+  Future<void> _verifyShadowParity(
+    Type syncable,
+    Map<String, dynamic> json, {
+    required String contentEnc,
+    required int keyVersion,
+    required String circleId,
+  }) async {
+    final encryption = _encryption[syncable]!;
+    final backendTable = _backendTables[syncable]!;
+    final rowId = json[idKey] as String;
+    try {
+      final fields = await _fieldCipher!.decryptContent(
+        table: backendTable,
+        rowId: rowId,
+        circleId: circleId,
+        contentEnc: contentEnc,
+        keyVersion: keyVersion,
+      );
+      final mismatched = [
+        for (final field in encryption.encryptedFields)
+          if (!_parityEquals(json[field], fields[field])) field,
+      ];
+      if (mismatched.isNotEmpty) {
+        _emitAlert(
+          SyncEncryptionAlert(
+            kind: SyncEncryptionAlertKind.shadowParityMismatch,
+            severity: SyncEncryptionAlertSeverity.warning,
+            table: backendTable,
+            rowId: rowId,
+            circleId: circleId,
+            keyVersion: keyVersion,
+            message:
+                'Decrypted blob disagrees with the plaintext column(s) '
+                '$mismatched',
+          ),
+        );
+      }
+    } on SyncCipherMissingKeyException {
+      _logger.fine(
+        'No key to verify shadow parity for $rowId in $backendTable',
+      );
+    } on SyncCipherAuthException catch (e) {
+      _emitAlert(
+        SyncEncryptionAlert(
+          kind: SyncEncryptionAlertKind.possibleTampering,
+          severity: SyncEncryptionAlertSeverity.critical,
+          table: backendTable,
+          rowId: rowId,
+          circleId: circleId,
+          keyVersion: keyVersion,
+          message:
+              'Shadow blob failed authentication (tampered or '
+              'transplanted): $e',
+        ),
+      );
+    }
+  }
+
+  /// Value equality for the shadow parity check. Timestamps may round-trip
+  /// with different serializations (Postgres `+00:00` vs Dart `Z`), so two
+  /// parseable strings compare as instants.
+  static bool _parityEquals(dynamic plaintext, dynamic decrypted) {
+    if (const DeepCollectionEquality().equals(plaintext, decrypted)) {
+      return true;
+    }
+    if (plaintext is String && decrypted is String) {
+      final p = DateTime.tryParse(plaintext);
+      final d = DateTime.tryParse(decrypted);
+      if (p != null && d != null) return p.isAtSameMomentAs(d);
+    }
+    return false;
+  }
+
+  /// Drops a pending locked-blob instruction when [item]'s write is skipped,
+  /// so a stale instruction can never be applied to a different version's
+  /// write later. Versioned on `updatedAt`, like the quarantines.
+  void _discardPendingLockedBlob(Type syncable, Syncable item) {
+    final pending = _pendingLockedBlobs[syncable];
+    if (pending == null) return;
+    final entry = pending[item.id];
+    if (entry != null && entry.forUpdatedAt == item.updatedAt) {
+      pending.remove(item.id);
+    }
+  }
+
   /// PostgREST surfaces transport-level failures — rate limits (429) and server
   /// errors (5xx) — as [PostgrestException]s with the HTTP status in [code], the
   /// same field that otherwise carries a Postgres SQLSTATE (e.g. '23505',
@@ -824,33 +1386,47 @@ class SyncManager<T extends SyncableDatabase> {
       // Skip rows the backend has permanently rejected (quarantined): a single
       // poison row must never re-wedge the whole table (MC-424 §B). A row whose
       // version moved on since it was quarantined (a local edit that may fix the
-      // rejection) is let through to retry.
+      // rejection) is let through to retry. The same versioned skip applies to
+      // rows deferred because their circle key is unavailable.
       final outgoing = outQueue.values
           .where((s) {
             final failedAt = quarantined[s.id];
             return failedAt == null || s.updatedAt.isAfter(failedAt);
           })
+          .where((s) => !_isEncryptionDeferred(syncable, s))
           .toSet();
       outQueue.clear();
 
       if (outgoing.isEmpty) continue;
 
-      _logger.info(
-        'Syncing ${outgoing.length} items to backend table $backendTable',
-      );
-
       assert(!outgoing.any((s) => s.userId?.isEmpty ?? true));
 
+      // Encode rows for the wire (the field-encryption seam): fold registered
+      // content fields into the blob according to the circle's mode. Rows that
+      // cannot be encrypted yet (missing circle key in enforced mode) are
+      // deferred — withheld from the wire, never dropped.
+      final encoded = <Syncable, Map<String, dynamic>>{};
+      for (final row in outgoing) {
+        final payload = await _encodeOutgoing(syncable, row);
+        if (payload != null) encoded[row] = payload;
+      }
+
+      if (encoded.isEmpty) continue;
+
+      _logger.info(
+        'Syncing ${encoded.length} items to backend table $backendTable',
+      );
+
       try {
-        await _upsertRows(backendTable, outgoing);
-        await _markPushed(syncable, outgoing);
+        await _upsertPayloads(backendTable, encoded.values);
+        await _markPushed(syncable, encoded.keys.toSet());
       } on PostgrestException catch (batchError) {
         if (_isTransientPostgrest(batchError)) {
           // PostgREST reports rate limits (429) and server errors (5xx) as
           // PostgrestExceptions too. Those are transient: re-enqueue the WHOLE
           // batch and back off — never fall through to per-row, which would
           // quarantine healthy rows over a passing backend hiccup (MC-424 §B/§C).
-          for (final row in outgoing) {
+          for (final row in encoded.keys) {
             outQueue[row.id] = row;
           }
           _logger.warning(
@@ -872,9 +1448,9 @@ class SyncManager<T extends SyncableDatabase> {
 
         final succeeded = <Syncable>{};
         final retry = <Syncable>{};
-        for (final row in outgoing) {
+        for (final row in encoded.keys) {
           try {
-            await _upsertRows(backendTable, {row});
+            await _upsertPayloads(backendTable, [encoded[row]!]);
             succeeded.add(row);
           } on PostgrestException catch (rowError, rowStack) {
             if (_isTransientPostgrest(rowError)) {
@@ -911,7 +1487,7 @@ class SyncManager<T extends SyncableDatabase> {
       } catch (batchError) {
         // Transient failure (network, etc.): re-enqueue the whole batch so it is
         // retried next pass — never dropped (MC-424 §C) — and back off.
-        for (final row in outgoing) {
+        for (final row in encoded.keys) {
           outQueue[row.id] = row;
         }
         _logger.warning(
@@ -923,12 +1499,160 @@ class SyncManager<T extends SyncableDatabase> {
     }
   }
 
-  Future<void> _upsertRows(String backendTable, Iterable<Syncable> rows) async {
-    await _supabaseClient.from(backendTable).upsert(
-      rows.map((x) => x.toJson()).toList(),
-      // GAM-389: conflict on id alone — one row per entity, not per user.
-      onConflict: idKey,
+  Future<void> _upsertPayloads(
+    String backendTable,
+    Iterable<Map<String, dynamic>> payloads,
+  ) async {
+    await _supabaseClient
+        .from(backendTable)
+        .upsert(
+          payloads.toList(),
+          // GAM-389: conflict on id alone — one row per entity, not per user.
+          onConflict: idKey,
+        );
+  }
+
+  /// Builds the wire payload for [row] — the push half of the encryption
+  /// seam. Returns `null` when the row must be withheld (enforced mode, key
+  /// unavailable); the row is then deferred, never dropped.
+  Future<Map<String, dynamic>?> _encodeOutgoing(
+    Type syncable,
+    Syncable row,
+  ) async {
+    final json = row.toJson();
+    final encryption = _encryption[syncable];
+    if (encryption == null) return json;
+
+    final backendTable = _backendTables[syncable]!;
+
+    // Locked guard, mode-independent: a locked row's content fields are
+    // placeholders and must NEVER be encrypted or pushed as plaintext. A
+    // legitimate plaintext-column write (e.g. a `deleted` tombstone) goes out
+    // with the ORIGINAL ciphertext forwarded verbatim — the seam never
+    // synthesizes a blob from a row it could not decrypt.
+    if (row is EncryptedSyncable && row.locked) {
+      for (final field in encryption.encryptedFields) {
+        json[field] = null;
+      }
+      json[contentEncKey] = row.lockedContentEnc;
+      json[keyVersionKey] = row.lockedKeyVersion;
+      if (row.lockedContentEnc == null) {
+        _logger.warning(
+          'Locked row ${row.id} in $backendTable has no preserved ciphertext; '
+          'pushing plaintext envelope only',
+        );
+      }
+      return json;
+    }
+
+    final circleId = json[circleIdKey] as String?;
+    final mode = circleId == null
+        ? SyncEncryptionMode.off
+        : await _fieldCipher!.modeFor(table: backendTable, circleId: circleId);
+
+    try {
+      switch (mode) {
+        case SyncEncryptionMode.off:
+          // Plaintext pass-through, but explicitly null the blob columns so a
+          // circle dropping back from shadow/enforced sheds its stale blobs
+          // (decrypt-and-restore). Registration implies the backend columns
+          // exist (the schema migration is a registration prerequisite).
+          json[contentEncKey] = null;
+          json[keyVersionKey] = null;
+        case SyncEncryptionMode.shadow:
+          // Dual-write: plaintext stays authoritative AND the blob rides
+          // along so parity can be verified on pull. A missing key only
+          // degrades this row to plaintext-only — shadow's contract is that
+          // plaintext is complete; key-distribution telemetry is not the push
+          // path's job.
+          try {
+            final blob = await _encryptFields(syncable, json, circleId!);
+            json[contentEncKey] = blob.contentEnc;
+            json[keyVersionKey] = blob.keyVersion;
+          } on SyncCipherMissingKeyException catch (e) {
+            json[contentEncKey] = null;
+            json[keyVersionKey] = null;
+            _logger.warning(
+              'No key to shadow-encrypt ${row.id} in $backendTable ($e); '
+              'pushed plaintext only',
+            );
+          }
+        case SyncEncryptionMode.enforced:
+          final blob = await _encryptFields(syncable, json, circleId!);
+          for (final field in encryption.encryptedFields) {
+            json[field] = null;
+          }
+          json[contentEncKey] = blob.contentEnc;
+          json[keyVersionKey] = blob.keyVersion;
+      }
+    } on SyncCipherMissingKeyException catch (e) {
+      // Enforced mode without the circle key: the row must not leave the
+      // device in plaintext. Defer it (it stays dirty locally) and surface a
+      // key-availability alert — once per row version, not per loop pass.
+      _deferForEncryption(syncable, row, circleId, e);
+      return null;
+    }
+
+    return json;
+  }
+
+  Future<SyncEncryptedBlob> _encryptFields(
+    Type syncable,
+    Map<String, dynamic> json,
+    String circleId,
+  ) {
+    final encryption = _encryption[syncable]!;
+    return _fieldCipher!.encryptContent(
+      table: _backendTables[syncable]!,
+      rowId: json[idKey] as String,
+      circleId: circleId,
+      fields: {
+        for (final field in encryption.encryptedFields) field: json[field],
+      },
     );
+  }
+
+  bool _isEncryptionDeferred(Type syncable, Syncable row) {
+    final deferred = _encryptionDeferred[syncable]?[row.id];
+    // A strictly-newer local edit is let through to retry (the key situation
+    // or the row itself may have changed), mirroring the quarantine rules.
+    return deferred != null && !row.updatedAt.isAfter(deferred.updatedAt);
+  }
+
+  void _deferForEncryption(
+    Type syncable,
+    Syncable row,
+    String? circleId,
+    SyncCipherMissingKeyException cause,
+  ) {
+    final deferred = _encryptionDeferred[syncable]!;
+    final previous = deferred[row.id];
+    deferred[row.id] = row;
+    final alreadyAlerted =
+        previous != null && !row.updatedAt.isAfter(previous.updatedAt);
+    if (alreadyAlerted) return;
+    _emitAlert(
+      SyncEncryptionAlert(
+        kind: SyncEncryptionAlertKind.keyUnavailable,
+        severity: SyncEncryptionAlertSeverity.info,
+        table: _backendTables[syncable]!,
+        rowId: row.id,
+        circleId: circleId,
+        keyVersion: null,
+        message: 'Push deferred until a circle key is available: $cause',
+      ),
+    );
+  }
+
+  void _emitAlert(SyncEncryptionAlert alert) {
+    _logger.warning(alert.toString());
+    try {
+      _onEncryptionAlert?.call(alert);
+    } catch (e, s) {
+      // coverage:ignore-start
+      _logger.severe('onEncryptionAlert callback threw: $e\n$s');
+      // coverage:ignore-end
+    }
   }
 
   /// Marks [pushed] rows as synced: records them as sent, clears their `dirty`
@@ -990,6 +1714,9 @@ class SyncManager<T extends SyncableDatabase> {
       if (sentItems.contains(item) ||
           receivedItems.contains(item) ||
           (failedAt != null && !item.updatedAt.isAfter(failedAt))) {
+        // A skipped item must also drop its locked-blob instruction (if this
+        // exact version produced one), or it could mis-apply to a later write.
+        _discardPendingLockedBlob(syncable, item);
         continue;
       }
       itemsToWrite[item.id] = item;
@@ -1022,16 +1749,29 @@ class SyncManager<T extends SyncableDatabase> {
 
     // Decide insert-vs-replace per row, keeping each row's verdict so a failed
     // batch can be retried one row at a time.
-    final decided = <({String id, UpdateCompanion<Syncable> companion, bool insert})>[];
+    final decided = <_IncomingWrite>[];
     for (final incomingItem in incomingItems.values) {
       final existingUpdatedAt = existingItems[incomingItem.id];
       if (existingUpdatedAt == null) {
-        decided.add((id: incomingItem.id, companion: incomingItem.toCompanion(), insert: true));
+        decided.add((
+          id: incomingItem.id,
+          updatedAt: incomingItem.updatedAt,
+          companion: incomingItem.toCompanion(),
+          insert: true,
+        ));
       } else if (incomingItem.updatedAt.isAfter(existingUpdatedAt)) {
-        decided.add((id: incomingItem.id, companion: incomingItem.toCompanion(), insert: false));
+        decided.add((
+          id: incomingItem.id,
+          updatedAt: incomingItem.updatedAt,
+          companion: incomingItem.toCompanion(),
+          insert: false,
+        ));
+      } else {
+        // Local copy is newer — leave it (and its dirty flag) untouched so a
+        // pending local edit still gets pushed. The discarded version's
+        // locked-blob instruction (if any) goes with it.
+        _discardPendingLockedBlob(syncable, incomingItem);
       }
-      // else: local copy is newer — leave it (and its dirty flag) untouched so a
-      // pending local edit still gets pushed.
     }
 
     if (decided.isEmpty) return;
@@ -1054,7 +1794,7 @@ class SyncManager<T extends SyncableDatabase> {
         } catch (rowError, rowStack) {
           // Quarantine at this row's version, so a strictly-newer backend
           // version later supersedes it instead of being dropped until restart.
-          quarantined[write.id] = incomingItems[write.id]!.updatedAt;
+          quarantined[write.id] = write.updatedAt;
           _logger.severe(
             'Quarantined poison incoming row ${write.id} in '
             '${_backendTables[syncable]}: $rowError\n$rowStack',
@@ -1077,7 +1817,7 @@ class SyncManager<T extends SyncableDatabase> {
   Future<void> _writeIncomingRows<S extends Syncable>(
     Type syncable,
     TableInfo<SyncableTable, S> table,
-    List<({String id, UpdateCompanion<Syncable> companion, bool insert})> writes,
+    List<_IncomingWrite> writes,
   ) async {
     if (writes.isEmpty) return;
 
@@ -1112,7 +1852,48 @@ class SyncManager<T extends SyncableDatabase> {
           table,
         )..where((tbl) => tbl.id.isIn(idChunk))).write(cleanCompanion);
       }
+
+      await _applyPendingLockedBlobs<S>(syncable, table, writes);
     });
+  }
+
+  /// Applies the locked-blob instructions produced at decode time to the rows
+  /// just written: sets the `locked` flag and preserves the verbatim
+  /// ciphertext in the fallback columns, atomically with the row write.
+  /// (The reverse — unlocking — needs no instruction: a decrypted model's
+  /// `toCompanion` carries `locked: false` and null fallbacks.)
+  Future<void> _applyPendingLockedBlobs<S extends Syncable>(
+    Type syncable,
+    TableInfo<SyncableTable, S> table,
+    List<_IncomingWrite> writes,
+  ) async {
+    final pending = _pendingLockedBlobs[syncable];
+    if (pending == null || pending.isEmpty) return;
+
+    for (final write in writes) {
+      final entry = pending[write.id];
+      if (entry == null) continue;
+      if (entry.forUpdatedAt != write.updatedAt) {
+        // The instruction belongs to a different version of this row than the
+        // one being written. Keep it only if it is newer (its own write may
+        // still be queued behind this one); a stale one is dropped.
+        if (!entry.forUpdatedAt.isAfter(write.updatedAt)) {
+          pending.remove(write.id);
+        }
+        continue;
+      }
+      pending.remove(write.id);
+      final lockCompanion =
+          (_companions[syncable]! as EncryptedCompanionConstructor)(
+                locked: const Value(true),
+                lockedContentEnc: Value(entry.contentEnc),
+                lockedKeyVersion: Value(entry.keyVersion),
+              )
+              as UpdateCompanion<S>;
+      await (_localDb.update(
+        table,
+      )..where((tbl) => tbl.id.equals(write.id))).write(lockCompanion);
+    }
   }
 
   DateTime? _lastPushedTimestamp(Type syncable) {
@@ -1176,6 +1957,82 @@ typedef CompanionConstructor =
       Value<bool> deleted,
       Value<bool> dirty,
     });
+
+/// The companion constructor of an [EncryptedSyncableTable] — the base
+/// columns plus the locked-row fallbacks. A generated Drift companion
+/// constructor for such a table satisfies this automatically; registration
+/// verifies it.
+typedef EncryptedCompanionConstructor =
+    Object Function({
+      Value<int> rowid,
+      Value<String> id,
+      Value<String?> userId,
+      Value<DateTime> updatedAt,
+      Value<bool> deleted,
+      Value<bool> dirty,
+      Value<bool> locked,
+      Value<String?> lockedContentEnc,
+      Value<int?> lockedKeyVersion,
+    });
+
+/// Opts a syncable into the field-encryption seam
+/// ([SyncManager.registerSyncable]'s `encryption` parameter).
+///
+/// Requirements:
+/// * The model implements [EncryptedSyncable] and its table implements
+///   [EncryptedSyncableTable] (local locked-row fallback columns).
+/// * The model's `toJson` uses the wire (snake_case) names listed in
+///   [encryptedFields], and tolerates unknown JSON keys in `fromJson`.
+/// * The backend table has `content_enc` (text) and `key_version` (int)
+///   columns, and the registered content columns are nullable. **This schema
+///   migration is a hard prerequisite for registering** — even off-mode
+///   pushes attach explicit `content_enc`/`key_version` nulls (that is what
+///   lets a circle shed stale blobs after decrypt-and-restore).
+/// * Rows are circle-scoped via a plaintext `circle_id` column; rows with a
+///   null `circle_id` sync as plaintext (there is no key scope to encrypt
+///   under).
+class SyncEncryption {
+  SyncEncryption({
+    required this.encryptedFields,
+    required this.lockedFieldPlaceholders,
+  });
+
+  /// Wire JSON keys folded into the encrypted blob on push and merged back on
+  /// pull. Anything sync, RLS, or the backend must read — `id`, `user_id`,
+  /// `updated_at`, `deleted`, `circle_id`, foreign-key columns — must NOT be
+  /// listed (registration rejects the seam-critical ones).
+  final Set<String> encryptedFields;
+
+  /// Values substituted for [encryptedFields] when a row arrives
+  /// undecryptable, so the locked placeholder row can still be constructed
+  /// via `fromJson`. Must cover every encrypted field `fromJson` requires;
+  /// fields without a placeholder decode as `null`.
+  final Map<String, dynamic> lockedFieldPlaceholders;
+}
+
+/// A decode-time instruction to persist a row's undecryptable ciphertext into
+/// its locked-row fallback columns, pinned to the row version it was produced
+/// for.
+class _PendingLockedBlob {
+  const _PendingLockedBlob({
+    required this.contentEnc,
+    required this.keyVersion,
+    required this.forUpdatedAt,
+  });
+
+  final String contentEnc;
+  final int? keyVersion;
+  final DateTime forUpdatedAt;
+}
+
+/// An incoming row write whose insert-vs-replace verdict has been decided,
+/// pinned to the row version it carries.
+typedef _IncomingWrite = ({
+  String id,
+  DateTime updatedAt,
+  UpdateCompanion<Syncable> companion,
+  bool insert,
+});
 
 enum TimestampType {
   lastSyncFromBackend('lastSyncFromBackend'),
