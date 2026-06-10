@@ -1,8 +1,10 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:drift/drift.dart' as drift;
 import 'package:drift/native.dart' as drift_native;
 import 'package:http/http.dart';
+import 'package:logging/logging.dart';
 import 'package:mockito/mockito.dart';
 import 'package:supabase/supabase.dart';
 import 'package:syncable/src/supabase_names.dart';
@@ -1510,6 +1512,189 @@ void main() {
       expect(subscribeCount, countAfterTeardown);
 
       syncManager.dispose();
+    });
+  });
+
+  group('Sweep observability (MC-424 §E)', () {
+    late List<LogRecord> records;
+    late StreamSubscription<LogRecord> logSub;
+    late Level previousRootLevel;
+
+    setUp(() {
+      previousRootLevel = Logger.root.level;
+      Logger.root.level = Level.ALL;
+      records = [];
+      logSub = Logger.root.onRecord.listen(records.add);
+    });
+
+    tearDown(() async {
+      await logSub.cancel();
+      Logger.root.level = previousRootLevel;
+    });
+
+    SyncManager<TestDatabase> buildManager() {
+      final syncManager = SyncManager<TestDatabase>(
+        localDatabase: testDb,
+        supabaseClient: mockSupabaseClient,
+        syncInterval: const Duration(milliseconds: 1),
+        syncTimestampStorage: TimestampStorage(),
+      );
+      syncManager.registerSyncable<Item>(
+        backendTable: itemsTable,
+        fromJson: Item.fromJson,
+        companionConstructor: ItemsCompanion.new,
+      );
+      return syncManager;
+    }
+
+    test('every sweep emits a per-table outcome line, even with nothing '
+        'to push or pull', () async {
+      // The June-10 stranded-cache incident: six consecutive sweeps fetched
+      // nothing and logged nothing, leaving a multi-day outage with zero
+      // telemetry. An empty sweep must still say it ran and what it saw.
+      final syncManager = buildManager();
+      syncManager.setUserId(const Uuid().v4());
+      syncManager.enableSync();
+      // enableSync fires its own (un-awaited) sweep; let it finish so it
+      // can't bleed an outcome line into the assertion window.
+      await waitForFunctionToPass(() async {
+        expect(
+          records.any((r) => r.message.startsWith('Sweep $itemsTable:')),
+          isTrue,
+        );
+      });
+      records.clear();
+
+      await syncManager.syncTables();
+      syncManager.dispose();
+
+      final outcome = records.where(
+        (r) =>
+            r.level == Level.INFO && r.message.startsWith('Sweep $itemsTable:'),
+      );
+      expect(
+        outcome,
+        hasLength(1),
+        reason: 'exactly one outcome line per table per sweep',
+      );
+      expect(outcome.single.message, contains('pulled 0'));
+      expect(
+        outcome.single.message,
+        contains('watermark'),
+        reason:
+            'outcome must carry the watermark used for the '
+            'incremental filter so an empty sweep is diagnosable',
+      );
+    });
+
+    test('a failing table sweep logs a severe naming the table, then '
+        'rethrows', () async {
+      // Today a mid-sweep throw surfaces app-side as a bare "reconcile
+      // failed" with no table attribution (FLUTTER-1R).
+      final syncManager = buildManager();
+      syncManager.setUserId(const Uuid().v4());
+      syncManager.enableSync();
+      // Let the enable-triggered sweep finish against the healthy stub
+      // before poisoning the metadata fetch.
+      await waitForFunctionToPass(() async {
+        expect(
+          records.any((r) => r.message.startsWith('Sweep $itemsTable:')),
+          isTrue,
+        );
+      });
+      when(mockHttpClient.get(any, headers: anyNamed('headers'))).thenAnswer(
+        (_) async => Response(
+          jsonEncode({'message': 'permission denied', 'code': '42501'}),
+          403,
+          request: Request('GET', Uri()),
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        ),
+      );
+      records.clear();
+
+      await expectLater(syncManager.syncTables(), throwsA(anything));
+      syncManager.dispose();
+
+      final severe = records.where(
+        (r) => r.level == Level.SEVERE && r.message.contains(itemsTable),
+      );
+      expect(severe, isNotEmpty, reason: 'failure must name the table');
+      expect(
+        severe.first.error,
+        isNotNull,
+        reason:
+            'the cause must travel with the record so the Sentry '
+            'bridge can attach it',
+      );
+    });
+
+    test('a row that stays dirty across sweeps raises one stuck-row severe '
+        'at the threshold, not one per sweep', () async {
+      // Persistent-transient push failure: the batch re-enqueues forever and
+      // dirty never clears, but (pre-§E) nothing ever reaches Sentry.
+      when(
+        mockHttpClient.post(
+          any,
+          headers: anyNamed('headers'),
+          body: anyNamed('body'),
+        ),
+      ).thenAnswer(
+        (_) async =>
+            Response('server error', 500, request: Request('POST', Uri())),
+      );
+
+      final syncManager = buildManager();
+      final userId = const Uuid().v4();
+      syncManager.setUserId(userId);
+      syncManager.enableSync();
+
+      final rowId = const Uuid().v4();
+      await testDb
+          .into(testDb.items)
+          .insert(
+            ItemsCompanion(
+              id: drift.Value(rowId),
+              userId: drift.Value(userId),
+              updatedAt: drift.Value(DateTime.now()),
+              deleted: const drift.Value(false),
+              name: const drift.Value('never pushes'),
+            ),
+          );
+
+      // Twice the threshold: the detector must fire exactly once, when the
+      // streak crosses the threshold — not on every later sweep.
+      for (var i = 0; i < 10; i++) {
+        await syncManager.syncTables();
+      }
+      syncManager.dispose();
+
+      final stuck = records.where(
+        (r) => r.level == Level.SEVERE && r.message.contains('Stuck row'),
+      );
+      expect(stuck, hasLength(1));
+      expect(stuck.single.message, contains(rowId));
+      expect(stuck.single.message, contains(itemsTable));
+    });
+
+    test('signed-out sweep states log at info, not warning', () async {
+      // "Syncing is disabled" is the normal signed-out state. At warning it
+      // becomes a Sentry capture on every signed-out launch (FLUTTER-1B/1C/1E).
+      final syncManager = buildManager();
+      records.clear();
+
+      await syncManager.syncTables(); // sync never enabled
+      syncManager.dispose();
+
+      expect(
+        records.where((r) => r.level >= Level.WARNING),
+        isEmpty,
+        reason: 'expected signed-out states must not be warnings',
+      );
+      expect(
+        records.map((r) => r.message),
+        contains(contains('syncing is disabled')),
+        reason: 'the state should still be visible as a breadcrumb',
+      );
     });
   });
 }
