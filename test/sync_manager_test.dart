@@ -1321,6 +1321,53 @@ void main() {
       },
     );
 
+    test(
+      'A full-resync sweep ignores the watermark even when one exists',
+      () async {
+        // When the set of rows a client may read GROWS for a non-temporal
+        // reason — e.g. joining a circle whose rows (and the circle row itself)
+        // were last modified BEFORE this client's last pull — the incremental
+        // `updated_at > watermark` filter silently skips them: they are older
+        // than the watermark yet only just became visible. A forced full
+        // resync must drop the filter so those pre-existing rows are pulled.
+        final syncManager = SyncManager<TestDatabase>(
+          localDatabase: testDb,
+          supabaseClient: mockSupabaseClient,
+          syncInterval: const Duration(milliseconds: 1),
+          syncTimestampStorage: TimestampStorage(),
+        );
+        syncManager.registerSyncable<Item>(
+          backendTable: itemsTable,
+          fromJson: Item.fromJson,
+          companionConstructor: ItemsCompanion.new,
+        );
+
+        syncManager.setUserId(const Uuid().v4());
+        syncManager.enableSync();
+
+        // First sweep establishes a watermark; the second is incremental
+        // (filtered on updated_at) — proving a watermark now exists.
+        await syncManager.syncTables();
+        await syncManager.syncTables();
+        // The forced full resync must NOT carry the updated_at filter despite
+        // the stored watermark.
+        await syncManager.syncTables(fullResync: true);
+        syncManager.dispose();
+
+        final metaUris = metadataGetUris();
+        expect(
+          metaUris.any((u) => u.query.contains('updated_at=gt.')),
+          isTrue,
+          reason: 'a watermark-bounded incremental sweep must have happened',
+        );
+        expect(
+          metaUris.last.query,
+          isNot(contains('updated_at=gt')),
+          reason: 'the full-resync sweep must ignore the watermark',
+        );
+      },
+    );
+
     test('Without a timestamp store every sweep stays a full sweep', () async {
       // No syncTimestampStorage → no watermark can be persisted → the filter can
       // never be applied, so behaviour must fall back to full sweeps.
