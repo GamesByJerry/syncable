@@ -790,6 +790,14 @@ class SyncManager<T extends SyncableDatabase> {
   /// regular local-change sweep alone would never pick them up (the same
   /// reasoning as the deferred-push re-enqueue in [retryLockedRows]).
   ///
+  /// **Restart durability:** the queue is in-memory; if the app stops
+  /// before draining, the rows stay persistently dirty but behind the
+  /// watermark. The required startup [retryLockedRows] call (see its docs)
+  /// re-enqueues every dirty row of encryption-registered tables from the
+  /// database, which covers exactly this gap — and an interrupted sweep's
+  /// epoch stays unswept, so the caller's lease machinery re-runs the
+  /// sweep regardless.
+  ///
   /// **Backend requirement:** because `updated_at` is unchanged, the
   /// backend's upsert path must accept a SAME-timestamp rewrite of an
   /// existing row. A backend that discards non-newer updates (e.g. a
