@@ -218,6 +218,19 @@ class SyncManager<T extends SyncableDatabase> {
   final Map<Type, Map<String, DateTime>> _outgoingQuarantined = {};
   final Map<Type, Map<String, DateTime>> _incomingQuarantined = {};
 
+  /// Stuck-row detector (MC-424 §E): per table, id -> (version, consecutive
+  /// reconcile sweeps the row has stayed dirty at that version). A row whose
+  /// streak crosses [_stuckRowSweepThreshold] raises ONE severe — re-armed only
+  /// if the row's `updatedAt` moves on — so a wedge that produces no other
+  /// telemetry (e.g. an endless transient-retry loop) is still visible without
+  /// flooding. Rows parked in the outgoing quarantine at the same version are
+  /// exempt: their rejection already raised a severe when they were
+  /// quarantined.
+  final Map<Type, Map<String, ({DateTime version, int sweeps})>> _dirtyStreaks =
+      {};
+
+  static const int _stuckRowSweepThreshold = 5;
+
   /// Field-encryption registration per syncable (only set for tables that
   /// participate in the seam).
   final Map<Type, SyncEncryption> _encryption = {};
@@ -335,6 +348,7 @@ class SyncManager<T extends SyncableDatabase> {
     _receivedItems[S] = {};
     _outgoingQuarantined[S] = {};
     _incomingQuarantined[S] = {};
+    _dirtyStreaks[S] = {};
     _pendingLockedBlobs[S] = {};
     _encryptionDeferred[S] = {};
   }
@@ -760,23 +774,31 @@ class SyncManager<T extends SyncableDatabase> {
     _maybeSubscribeToLocalChanges();
     _maybeSubscribeToBackendChanges();
 
-    await _syncTables(reason);
+    // Fire-and-forget callers (enableSync / setUserId / device-active) drop
+    // this Future, so a throwing sweep would otherwise become an UNHANDLED
+    // async error in the host app — invisible as a sync failure. Contain it
+    // here; _syncTables already logged a severe naming the failing table. The
+    // explicit [syncTables] API still propagates to its caller.
+    try {
+      await _syncTables(reason);
+    } catch (_) {
+      // Logged at the failure site with table attribution.
+    }
   }
 
   void _maybeSubscribeToLocalChanges() {
     _clearLocalSubscriptions();
 
+    // Expected while signed out — INFO, not a Sentry-captured warning.
     if (!_syncingEnabled) {
-      _logger.warning(
+      _logger.info(
         'Not subscribed to local changes because syncing is disabled',
       );
       return;
     }
 
     if (userId.isEmpty) {
-      _logger.warning(
-        'Not subscribed to local changes because user ID is empty',
-      );
+      _logger.info('Not subscribed to local changes because user ID is empty');
       return;
     }
 
@@ -797,7 +819,8 @@ class SyncManager<T extends SyncableDatabase> {
     _logger.info('Subscribed to local changes');
   }
 
-  void _pushLocalChangesToOutQueue(Type syncable, Iterable<Syncable> rows) {
+  /// Returns the number of rows enqueued (for sweep outcome logging).
+  int _pushLocalChangesToOutQueue(Type syncable, Iterable<Syncable> rows) {
     final outQueue = _outQueues[syncable]!;
     final receivedItems = _receivedItems[syncable]!;
 
@@ -805,7 +828,7 @@ class SyncManager<T extends SyncableDatabase> {
         row.updatedAt.isAfter(outQueue[row.id]?.updatedAt ?? DateTime(0)) &&
         row.updatedAt.isAfter(_lastPushedTimestamp(syncable) ?? DateTime(0));
 
-    var enqueuedAny = false;
+    var enqueued = 0;
     for (final row
         in rows
             // Only push rows with unpushed LOCAL changes. A row pulled from the
@@ -817,12 +840,57 @@ class SyncManager<T extends SyncableDatabase> {
             .where((r) => !receivedItems.contains(r))
             .where(updateHasNotBeenSentYet)) {
       outQueue[row.id] = row;
-      enqueuedAny = true;
+      enqueued++;
     }
 
     // Drain the new work now rather than on the next backstop tick. Reached from
     // the local-change Drift subscription (writer side) and from _syncTable.
-    if (enqueuedAny) _wake();
+    if (enqueued > 0) _wake();
+    return enqueued;
+  }
+
+  /// MC-424 §E stuck-row detector: called once per reconcile sweep per table
+  /// (NOT from the fast wake loop) with the full local row set. A row that
+  /// stays dirty at the same version across [_stuckRowSweepThreshold]
+  /// consecutive sweeps means pushes are not succeeding and nothing else may
+  /// be saying so (e.g. an endless transient-retry loop) — raise one severe
+  /// exactly when the streak crosses the threshold.
+  void _trackStuckRows(Type syncable, Iterable<Syncable> rows) {
+    final streaks = _dirtyStreaks[syncable]!;
+    final quarantined = _outgoingQuarantined[syncable]!;
+
+    final dirtyNow = {
+      for (final r in rows.where((r) => r.dirty)) r.id: r.updatedAt,
+    };
+
+    // A row that pushed (or was deleted) since last sweep ends its streak.
+    streaks.removeWhere((id, _) => !dirtyNow.containsKey(id));
+
+    dirtyNow.forEach((id, version) {
+      // Quarantined at this version: already reported once, and parked on
+      // purpose — counting it again would double-report every wedge.
+      final quarantinedAt = quarantined[id];
+      if (quarantinedAt != null && !version.isAfter(quarantinedAt)) {
+        streaks.remove(id);
+        return;
+      }
+
+      final prev = streaks[id];
+      if (prev == null || prev.version != version) {
+        // New dirty row, or a local edit moved the version on: (re)arm.
+        streaks[id] = (version: version, sweeps: 1);
+        return;
+      }
+
+      final sweeps = prev.sweeps + 1;
+      streaks[id] = (version: version, sweeps: sweeps);
+      if (sweeps == _stuckRowSweepThreshold) {
+        _logger.severe(
+          'Stuck row: $id in ${_backendTables[syncable]} still dirty after '
+          '$sweeps sweeps without a successful push',
+        );
+      }
+    });
   }
 
   void _maybeSubscribeToBackendChanges() {
@@ -835,6 +903,7 @@ class SyncManager<T extends SyncableDatabase> {
       }
 
       String reason;
+      var expected = true;
 
       if (!__syncingEnabled) {
         reason = 'syncing is disabled';
@@ -844,9 +913,15 @@ class SyncManager<T extends SyncableDatabase> {
         reason = 'no other devices are active';
       } else {
         reason = '... good question. Please file an issue';
+        expected = false;
       }
 
-      _logger.warning('Not subscribed to backend changes because $reason');
+      // The known reasons are normal states (signed out, solo device) — INFO
+      // breadcrumbs, not Sentry captures. Only the can't-happen fallback warns.
+      _logger.log(
+        expected ? Level.INFO : Level.WARNING,
+        'Not subscribed to backend changes because $reason',
+      );
 
       return;
     }
@@ -961,37 +1036,63 @@ class SyncManager<T extends SyncableDatabase> {
   }
 
   Future<void> _syncTables(String reason, {bool fullResync = false}) async {
+    // Expected idle states (signed out / pre-login), not faults: INFO so they
+    // stay visible as breadcrumbs without becoming a Sentry capture on every
+    // signed-out launch (MC-424 §E).
     if (!__syncingEnabled) {
-      _logger.warning('Tables not getting synced because syncing is disabled');
+      _logger.info('Tables not getting synced because syncing is disabled');
       return;
     }
 
     if (userId.isEmpty) {
-      _logger.warning('Tables not getting synced because user ID is empty');
+      _logger.info('Tables not getting synced because user ID is empty');
       return;
     }
 
-    _logger.info('Syncing all tables. Reason: $reason');
+    // The identity matters for forensics: watermarks are stored per-user, so a
+    // sweep running under an unexpected user ID explains "fetched nothing".
+    _logger.info('Syncing all tables. Reason: $reason (user: $_userId)');
 
     for (final syncable in _syncables) {
-      await _syncTable(syncable, fullResync: fullResync);
+      try {
+        await _syncTable(syncable, fullResync: fullResync);
+      } catch (e, s) {
+        // Name the table before propagating: app-side this otherwise surfaces
+        // as a bare "reconcile failed" with no attribution (MC-424 §E).
+        _logger.severe(
+          'Sweep failed at table ${_backendTables[syncable]}',
+          e,
+          s,
+        );
+        rethrow;
+      }
     }
 
     _nFullSyncs++;
   }
 
   Future<void> _syncTable(Type syncable, {bool fullResync = false}) async {
-    if (!_syncingEnabled) return;
+    final table = _backendTables[syncable];
+
+    if (!_syncingEnabled) {
+      _logger.info('Sweep $table: skipped (syncing disabled)');
+      return;
+    }
 
     final localItems = await _localDb.select(_localTables[syncable]!).get();
 
     // Check after async gap
-    if (!_syncingEnabled) return;
+    if (!_syncingEnabled) {
+      _logger.info('Sweep $table: skipped (syncing disabled mid-sweep)');
+      return;
+    }
 
     assert(_userId.isNotEmpty);
     // GAM-389: push ALL local rows, not just this user's. The updatedAt /
     // receivedItems dedup below still guards against echoing pulled rows.
-    _pushLocalChangesToOutQueue(syncable, localItems);
+    final queued = _pushLocalChangesToOutQueue(syncable, localItems);
+
+    _trackStuckRows(syncable, localItems);
 
     // A forced full resync must always pull: the caller is widening visibility
     // (e.g. a just-joined circle), so the "no other device was active" shortcut
@@ -999,8 +1100,8 @@ class SyncManager<T extends SyncableDatabase> {
     // not suppress it.
     if (!fullResync && _skipSyncFromBackend(syncable)) {
       _logger.info(
-        'Skipping sync of table ${_backendTables[syncable]} from backend '
-        'because no other device was active since last sync',
+        'Sweep $table: queued $queued for push, pull skipped '
+        '(no other device active since last sync)',
       );
       return;
     }
@@ -1008,6 +1109,12 @@ class SyncManager<T extends SyncableDatabase> {
     final localItemsUpdatedAt = {for (final i in localItems) i.id: i.updatedAt};
 
     assert(_userId.isNotEmpty);
+    // The watermark the metadata fetch will filter on — logged with the
+    // outcome so a sweep that "fetched nothing" is diagnosable (was it a full
+    // sweep, or incremental against a watermark that's ahead of the data?).
+    final watermark = fullResync
+        ? null
+        : _lastPulledTimestamp(syncable)?.toUtc();
     // Capture the watermark BEFORE fetching: any row written while this pull is
     // in flight has updatedAt >= pullStartedAt, so the next reconcile's
     // `> pullStartedAt - overlap` filter still catches it.
@@ -1022,15 +1129,12 @@ class SyncManager<T extends SyncableDatabase> {
       localItemsUpdatedAt,
     );
 
-    if (itemsToPull.isNotEmpty) {
-      _logger.info(
-        "Syncing ${itemsToPull.length} items from backend table '${_backendTables[syncable]}'",
-      );
-    }
-
     // Use batches because all the UUIDs make the URI become too long otherwise.
     for (final batch in itemsToPull.slices(100)) {
-      if (!_syncingEnabled) return;
+      if (!_syncingEnabled) {
+        _logger.info('Sweep $table: aborted (syncing disabled mid-pull)');
+        return;
+      }
       final pulledBatch = await _supabaseClient
           .from(_backendTables[syncable]!)
           .select()
@@ -1047,6 +1151,15 @@ class SyncManager<T extends SyncableDatabase> {
     }
 
     await _updateLastPulledTimeStamp(syncable, pullStartedAt);
+
+    // One outcome line per table per sweep — an empty sweep must still say it
+    // ran and what it saw (MC-424 §E: six silent empty sweeps hid a multi-day
+    // stranded-cache outage).
+    _logger.info(
+      'Sweep $table: queued $queued for push, pulled ${itemsToPull.length} '
+      'of ${backendItems.length} backend candidates '
+      '(watermark: ${watermark?.toIso8601String() ?? 'none — full sweep'})',
+    );
   }
 
   bool _skipSyncFromBackend(Type syncable) {
@@ -1086,7 +1199,9 @@ class SyncManager<T extends SyncableDatabase> {
     // A forced full resync deliberately discards the watermark so the sweep is
     // unbounded — see [syncTables]'s `fullResync`. Rows that became newly
     // readable but predate the watermark are only caught by an unbounded sweep.
-    final lastPulled = fullResync ? null : _lastPulledTimestamp(syncable)?.toUtc();
+    final lastPulled = fullResync
+        ? null
+        : _lastPulledTimestamp(syncable)?.toUtc();
     final changedSince = lastPulled?.subtract(_reconcileOverlap);
 
     int offset = 0;
