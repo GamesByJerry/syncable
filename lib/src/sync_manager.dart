@@ -462,6 +462,18 @@ class SyncManager<T extends SyncableDatabase> {
   /// Wakes the sync loop if it is currently parked in [_idle]. A no-op when the
   /// loop is busy (no pending signal): the freshly enqueued work is already in a
   /// queue, so the loop's next [_idle] queue check drains it without a signal.
+  /// Re-enqueues [row] unless a NEWER version of it is already queued: a
+  /// stale in-flight snapshot (sweep re-push, transient-failure retry) must
+  /// never displace a concurrent local edit the drift subscription has
+  /// already queued (MC-430 review). The local-change path itself always
+  /// reads fresh rows, so newest-wins here is strictly safe.
+  void _enqueueKeepingNewest(Map<String, Syncable> outQueue, Syncable row) {
+    final queued = outQueue[row.id];
+    if (queued == null || !queued.updatedAt.isAfter(row.updatedAt)) {
+      outQueue[row.id] = row;
+    }
+  }
+
   void _wake() {
     final signal = _wakeSignal;
     if (signal != null && !signal.isCompleted) {
@@ -639,22 +651,35 @@ class SyncManager<T extends SyncableDatabase> {
           final item = _fromJsons[syncable]!(json);
 
           await _localDb.transaction(() async {
-            // The decoded model carries the real content plus cleared locked
-            // state; its companion rewrites the row in place.
-            await (_localDb.update(
-              table,
-            )..where((tbl) => tbl.id.equals(row.id))).write(item.toCompanion());
+            // Version-guarded (the _markPushed pattern): the decrypt above is
+            // async, and the row may have legitimately changed since the
+            // locked snapshot was read — e.g. a tombstone swipe-delete, which
+            // IS allowed on locked rows. An unguarded overwrite would erase
+            // that newer write (resurrecting a deleted row and suppressing
+            // its push). A 0-row match means the row moved on: skip — the
+            // next retry sees the fresh state.
+            final updated =
+                await (_localDb.update(table)..where(
+                      (tbl) =>
+                          tbl.id.equals(row.id) &
+                          tbl.updatedAt.equals(row.updatedAt),
+                    ))
+                    .write(item.toCompanion());
+            if (updated == 0) return;
             // toCompanion defaults dirty=true. Restore the row's original
             // flag: an unlock is not a local edit (no re-push), but a pending
             // local write (e.g. a tombstone) must survive the unlock.
             final dirtyCompanion =
                 _companions[syncable]!(dirty: Value(row.dirty))
                     as UpdateCompanion<Syncable>;
-            await (_localDb.update(
-              table,
-            )..where((tbl) => tbl.id.equals(row.id))).write(dirtyCompanion);
+            await (_localDb.update(table)..where(
+                  (tbl) =>
+                      tbl.id.equals(row.id) &
+                      tbl.updatedAt.equals(row.updatedAt),
+                ))
+                .write(dirtyCompanion);
+            unlocked++;
           });
-          unlocked++;
         } on SyncCipherMissingKeyException {
           _logger.fine(
             'Row ${row.id} in $backendTable stays locked '
@@ -689,6 +714,16 @@ class SyncManager<T extends SyncableDatabase> {
     for (final syncable in _syncables) {
       if (_encryption[syncable] == null) continue;
       _encryptionDeferred[syncable]!.clear();
+      // Key material / circle-mode changes are legitimate "world changed"
+      // events for the OUTGOING quarantine too (MC-430): a push rejected by
+      // the enforced-mode plaintext guard while this device's mode cache was
+      // stale quarantines at the row's unchanged updatedAt, and no later
+      // edit may ever bump it — without this clear, the row would stay
+      // invisible to the circle until app restart. Re-encoding under the
+      // now-current mode/keys is exactly the retry the quarantine was
+      // waiting for; a still-poison row simply re-quarantines on the next
+      // rejection.
+      _outgoingQuarantined[syncable]!.clear();
 
       final table = _localTables[syncable]!;
       final dirtyColumn =
@@ -700,7 +735,7 @@ class SyncManager<T extends SyncableDatabase> {
 
       final outQueue = _outQueues[syncable]!;
       for (final row in dirtyRows) {
-        outQueue[row.id] = row;
+        _enqueueKeepingNewest(outQueue, row);
       }
       reenqueued = true;
     }
@@ -842,7 +877,7 @@ class SyncManager<T extends SyncableDatabase> {
       });
       final outQueue = _outQueues[syncable]!;
       for (final row in toMark) {
-        outQueue[row.id] = row;
+        _enqueueKeepingNewest(outQueue, row);
       }
       marked += toMark.length;
     }
@@ -1694,7 +1729,7 @@ class SyncManager<T extends SyncableDatabase> {
           // batch and back off — never fall through to per-row, which would
           // quarantine healthy rows over a passing backend hiccup (MC-424 §B/§C).
           for (final row in encoded.keys) {
-            outQueue[row.id] = row;
+            _enqueueKeepingNewest(outQueue, row);
           }
           _logger.warning(
             'Transient PostgrestException pushing to $backendTable '
@@ -1747,7 +1782,7 @@ class SyncManager<T extends SyncableDatabase> {
           // Re-enqueue the rows we never got a verdict on so the next loop pass
           // retries them, then back off (don't spin this pass).
           for (final row in retry) {
-            outQueue[row.id] = row;
+            _enqueueKeepingNewest(outQueue, row);
           }
           return;
         }
@@ -1755,7 +1790,7 @@ class SyncManager<T extends SyncableDatabase> {
         // Transient failure (network, etc.): re-enqueue the whole batch so it is
         // retried next pass — never dropped (MC-424 §C) — and back off.
         for (final row in encoded.keys) {
-          outQueue[row.id] = row;
+          _enqueueKeepingNewest(outQueue, row);
         }
         _logger.warning(
           'Transient failure pushing to $backendTable ($batchError); '
