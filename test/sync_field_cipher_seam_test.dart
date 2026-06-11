@@ -1617,6 +1617,255 @@ void main() {
     });
   });
 
+  group('Unlock & quarantine recovery (MC-430 review)', () {
+    test('a tombstone written while an unlock decrypt is in flight survives '
+        '— the unlock is version-guarded', () async {
+      final cipher = FakeFieldCipher()
+        ..circleModes[circleId] = SyncEncryptionMode.enforced;
+      final syncManager = buildManager(
+        cipher: cipher,
+        encryption: secretItemsEncryption(),
+      );
+      final userId = const Uuid().v4();
+      syncManager.setUserId(userId);
+      syncManager.enableSync();
+
+      // A row arrives undecryptable (no key yet) and locks.
+      final id = const Uuid().v4();
+      final blob = cipher.blobFor(
+        table: secretItemsTable,
+        rowId: id,
+        circleId: circleId,
+        keyVersion: 1,
+        fields: const {titleKey: 'secret', amountKey: 5},
+      );
+      backendRows = [
+        enforcedWireRow(
+          cipher,
+          id: id,
+          userId: userId,
+          updatedAt: DateTime.now().toUtc(),
+          contentEnc: blob,
+          keyVersion: 1,
+        ),
+      ];
+      await waitForFunctionToPass(() async {
+        await syncManager.syncTables();
+        expect((await localRow(id)).locked, isTrue);
+      });
+      backendRows = [];
+
+      // The key arrives; the unlock decrypt is artificially slow, and the
+      // user swipe-deletes the locked row (allowed — tombstones forward the
+      // preserved blob) while the decrypt is in flight.
+      cipher.keys[circleId] = {1};
+      cipher.blobDecryptDelays[blob] = const Duration(milliseconds: 150);
+      final retry = syncManager.retryLockedRows();
+      await Future<void>.delayed(const Duration(milliseconds: 30));
+      final tombstoneAt = DateTime.now().toUtc();
+      await (testDb.update(
+        testDb.secretItems,
+      )..where((t) => t.id.equals(id))).write(
+        SecretItemsCompanion(
+          deleted: const drift.Value(true),
+          updatedAt: drift.Value(tombstoneAt),
+          dirty: const drift.Value(true),
+        ),
+      );
+
+      final unlocked = await retry;
+      expect(unlocked, 0, reason: 'the row moved on — unlock must skip');
+      final row = await localRow(id);
+      expect(row.deleted, isTrue, reason: 'the tombstone must survive');
+      expect(row.updatedAt.isAtSameMomentAs(tombstoneAt), isTrue);
+      expect(
+        row.locked,
+        isTrue,
+        reason: 'still locked — the next retry decrypts the fresh snapshot',
+      );
+      // The tombstone either already pushed (retryLockedRows re-enqueues
+      // dirty rows, clearing the flag on success) or is still pending —
+      // but it must never have been replaced by a resurrected push.
+      if (!row.dirty) {
+        expect(pushedRows(), isNotEmpty);
+        expect(pushedRows().last[deletedKey], isTrue);
+      }
+      expect(
+        pushedRows().where((r) => r[deletedKey] == false),
+        isEmpty,
+        reason: 'no resurrected (deleted=false) version may reach the wire',
+      );
+
+      syncManager.dispose();
+    });
+
+    test('retryLockedRows clears the outgoing quarantine of encrypted '
+        'tables, so a push rejected under a stale mode retries once the '
+        'world changes', () async {
+      final cipher = FakeFieldCipher()
+        ..circleModes[circleId] = SyncEncryptionMode.shadow
+        ..keys[circleId] = {1};
+      final syncManager = buildManager(
+        cipher: cipher,
+        encryption: secretItemsEncryption(),
+      );
+      final userId = const Uuid().v4();
+
+      // The backend permanently rejects the first two posts (the batch and
+      // its per-row fallback) — modelling the enforced-mode plaintext guard
+      // rejecting a stale shadow-shaped push.
+      var failuresLeft = 2;
+      when(
+        mockHttpClient.post(
+          any,
+          headers: anyNamed('headers'),
+          body: anyNamed('body'),
+        ),
+      ).thenAnswer((inv) async {
+        final body = inv.namedArguments[#body] as String;
+        if (failuresLeft > 0) {
+          failuresLeft--;
+          return Response(
+            jsonEncode({
+              'code': '42501',
+              'message': 'E2E_PLAINTEXT_REJECTED: stale mode',
+              'details': 'Forbidden',
+              'hint': null,
+            }),
+            403,
+            request: Request('POST', Uri()),
+            headers: {'content-type': 'application/json; charset=utf-8'},
+          );
+        }
+        pushedBatches.add(
+          (jsonDecode(body) as List).cast<Map<String, dynamic>>(),
+        );
+        return Response(
+          body,
+          200,
+          request: Request('POST', Uri()),
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        );
+      });
+
+      syncManager.setUserId(userId);
+      syncManager.enableSync();
+      await insertLocal(userId: userId, title: 'stranded edit');
+
+      // The push fails permanently and the row is quarantined: further
+      // passes attempt nothing (no successful post recorded).
+      await waitForFunctionToPass(() async {
+        expect(failuresLeft, 0);
+      });
+      await syncManager.syncTables();
+      expect(pushedRows(), isEmpty);
+
+      // The world changes: the circle is now known to be enforced. The
+      // key/mode-change retry hook must clear the quarantine so the row
+      // re-encodes (enforced-shaped) and finally lands.
+      cipher.circleModes[circleId] = SyncEncryptionMode.enforced;
+      await syncManager.retryLockedRows();
+      await waitForFunctionToPass(() async {
+        expect(syncManager.nSyncedToBackend(SecretItem), 1);
+      });
+      final pushed = pushedRows().single;
+      expect(pushed[titleKey], isNull);
+      expect(pushed[contentEncKey], isNotNull);
+
+      syncManager.dispose();
+    });
+  });
+
+  group('Re-encrypt sweep (repushRowsForReencrypt)', () {
+    test("re-pushes a circle's rows under the active key WITHOUT bumping "
+        'updated_at; locked rows are skipped', () async {
+      final cipher = FakeFieldCipher()
+        ..circleModes[circleId] = SyncEncryptionMode.enforced
+        ..keys[circleId] = {1, 2};
+      final syncManager = buildManager(
+        cipher: cipher,
+        encryption: secretItemsEncryption(),
+      );
+      final userId = const Uuid().v4();
+      syncManager.setUserId(userId);
+      syncManager.enableSync();
+
+      // The circle synced while v1 was active (local row is clean), then the
+      // key rotated to v2 — the sweep must rewrite the backend blob.
+      final id = const Uuid().v4();
+      final originalUpdatedAt = DateTime.now().toUtc();
+      backendRows = [
+        enforcedWireRow(
+          cipher,
+          id: id,
+          userId: userId,
+          updatedAt: originalUpdatedAt,
+          title: 'sweep me',
+          amount: 12,
+          keyVersion: 1,
+        ),
+      ];
+      await waitForFunctionToPass(() async {
+        await syncManager.syncTables();
+        expect((await localRow(id)).title, 'sweep me');
+      });
+      backendRows = [];
+      expect(pushedRows(), isEmpty);
+
+      // A locked row of the same circle must never be marked for re-push:
+      // its content fields are placeholders, not a source for encryption
+      // (the seam would forward its preserved blob verbatim — pointless
+      // churn the sweep skips outright).
+      await testDb
+          .into(testDb.secretItems)
+          .insert(
+            SecretItemsCompanion(
+              id: drift.Value(const Uuid().v4()),
+              userId: drift.Value(userId),
+              updatedAt: drift.Value(DateTime.now().toUtc()),
+              circleId: drift.Value(circleId),
+              title: const drift.Value('🔒'),
+              amount: const drift.Value(0),
+              dirty: const drift.Value(false),
+              locked: const drift.Value(true),
+              lockedContentEnc: const drift.Value('preserved-blob'),
+              lockedKeyVersion: const drift.Value(9),
+            ),
+          );
+
+      cipher.activeKeyVersion = 2;
+      final marked = await syncManager.repushRowsForReencrypt(
+        circleId: circleId,
+      );
+      expect(marked, 1, reason: 'the locked row must be skipped');
+
+      await waitForFunctionToPass(() async {
+        expect(syncManager.nSyncedToBackend(SecretItem), 1);
+      });
+      final pushed = pushedRows().single;
+      expect(pushed[idKey], id);
+      expect(pushed[titleKey], isNull);
+      expect(pushed[amountKey], isNull);
+      expect(pushed[keyVersionKey], 2);
+      final blob =
+          jsonDecode(utf8.decode(base64Decode(pushed[contentEncKey] as String)))
+              as Map<String, dynamic>;
+      expect(blob['fields'], {titleKey: 'sweep me', amountKey: 12});
+      expect(
+        DateTime.parse(
+          pushed[updatedAtKey] as String,
+        ).isAtSameMomentAs(originalUpdatedAt),
+        isTrue,
+        reason:
+            'a re-encrypt is not an edit: updated_at must NOT be bumped, so '
+            'other devices do not re-pull unchanged content and the sweep '
+            'never wins an LWW race against a genuine concurrent edit',
+      );
+
+      syncManager.dispose();
+    });
+  });
+
   group('Registration validation', () {
     test('encryption requires a field cipher on the manager', () {
       final syncManager = SyncManager<TestDatabase>(
