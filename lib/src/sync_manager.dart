@@ -790,6 +790,14 @@ class SyncManager<T extends SyncableDatabase> {
   /// regular local-change sweep alone would never pick them up (the same
   /// reasoning as the deferred-push re-enqueue in [retryLockedRows]).
   ///
+  /// **Backend requirement:** because `updated_at` is unchanged, the
+  /// backend's upsert path must accept a SAME-timestamp rewrite of an
+  /// existing row. A backend that discards non-newer updates (e.g. a
+  /// `discard_older_updates`-style trigger comparing
+  /// `NEW.updated_at <= OLD.updated_at`) silently drops these re-pushes and
+  /// the sweep can never converge — exempt same-timestamp updates (or the
+  /// crypto columns) in such a trigger before using this.
+  ///
   /// Returns the number of rows marked for re-push.
   Future<int> repushRowsForReencrypt({required String circleId}) async {
     var marked = 0;
@@ -804,18 +812,31 @@ class SyncManager<T extends SyncableDatabase> {
       final rows = await (_localDb.select(
         table,
       )..where((_) => circleIdColumn.equals(circleId))).get();
+      final toMark = [
+        for (final row in rows)
+          if (row is! EncryptedSyncable || !row.locked) row,
+      ];
+      if (toMark.isEmpty) continue;
+
+      // One batch per table: a rotation sweep can touch thousands of rows,
+      // and per-row updates would mean thousands of individual commits.
+      final companion =
+          _companions[syncable]!(dirty: const Value(true))
+              as UpdateCompanion<Syncable>;
+      await _localDb.batch((batch) {
+        for (final row in toMark) {
+          batch.update(
+            table,
+            companion,
+            where: (tbl) => tbl.id.equals(row.id),
+          );
+        }
+      });
       final outQueue = _outQueues[syncable]!;
-      for (final row in rows) {
-        if (row is EncryptedSyncable && row.locked) continue;
-        final companion =
-            _companions[syncable]!(dirty: const Value(true))
-                as UpdateCompanion<Syncable>;
-        await (_localDb.update(
-          table,
-        )..where((tbl) => tbl.id.equals(row.id))).write(companion);
+      for (final row in toMark) {
         outQueue[row.id] = row;
-        marked++;
       }
+      marked += toMark.length;
     }
     if (marked > 0) {
       _wake();
