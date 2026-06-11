@@ -1617,6 +1617,96 @@ void main() {
     });
   });
 
+  group('Re-encrypt sweep (repushRowsForReencrypt)', () {
+    test("re-pushes a circle's rows under the active key WITHOUT bumping "
+        'updated_at; locked rows are skipped', () async {
+      final cipher = FakeFieldCipher()
+        ..circleModes[circleId] = SyncEncryptionMode.enforced
+        ..keys[circleId] = {1, 2};
+      final syncManager = buildManager(
+        cipher: cipher,
+        encryption: secretItemsEncryption(),
+      );
+      final userId = const Uuid().v4();
+      syncManager.setUserId(userId);
+      syncManager.enableSync();
+
+      // The circle synced while v1 was active (local row is clean), then the
+      // key rotated to v2 — the sweep must rewrite the backend blob.
+      final id = const Uuid().v4();
+      final originalUpdatedAt = DateTime.now().toUtc();
+      backendRows = [
+        enforcedWireRow(
+          cipher,
+          id: id,
+          userId: userId,
+          updatedAt: originalUpdatedAt,
+          title: 'sweep me',
+          amount: 12,
+          keyVersion: 1,
+        ),
+      ];
+      await waitForFunctionToPass(() async {
+        await syncManager.syncTables();
+        expect((await localRow(id)).title, 'sweep me');
+      });
+      backendRows = [];
+      expect(pushedRows(), isEmpty);
+
+      // A locked row of the same circle must never be marked for re-push:
+      // its content fields are placeholders, not a source for encryption
+      // (the seam would forward its preserved blob verbatim — pointless
+      // churn the sweep skips outright).
+      await testDb
+          .into(testDb.secretItems)
+          .insert(
+            SecretItemsCompanion(
+              id: drift.Value(const Uuid().v4()),
+              userId: drift.Value(userId),
+              updatedAt: drift.Value(DateTime.now().toUtc()),
+              circleId: drift.Value(circleId),
+              title: const drift.Value('🔒'),
+              amount: const drift.Value(0),
+              dirty: const drift.Value(false),
+              locked: const drift.Value(true),
+              lockedContentEnc: const drift.Value('preserved-blob'),
+              lockedKeyVersion: const drift.Value(9),
+            ),
+          );
+
+      cipher.activeKeyVersion = 2;
+      final marked = await syncManager.repushRowsForReencrypt(
+        circleId: circleId,
+      );
+      expect(marked, 1, reason: 'the locked row must be skipped');
+
+      await waitForFunctionToPass(() async {
+        expect(syncManager.nSyncedToBackend(SecretItem), 1);
+      });
+      final pushed = pushedRows().single;
+      expect(pushed[idKey], id);
+      expect(pushed[titleKey], isNull);
+      expect(pushed[amountKey], isNull);
+      expect(pushed[keyVersionKey], 2);
+      final blob =
+          jsonDecode(utf8.decode(base64Decode(pushed[contentEncKey] as String)))
+              as Map<String, dynamic>;
+      expect(blob['fields'], {titleKey: 'sweep me', amountKey: 12});
+      expect(
+        DateTime.parse(
+          pushed[updatedAtKey] as String,
+        ).isAtSameMomentAs(originalUpdatedAt),
+        isTrue,
+        reason:
+            'a re-encrypt is not an edit: updated_at must NOT be bumped, so '
+            'other devices do not re-pull unchanged content and the sweep '
+            'never wins an LWW race against a genuine concurrent edit',
+      );
+
+      syncManager.dispose();
+    });
+  });
+
   group('Registration validation', () {
     test('encryption requires a field cipher on the manager', () {
       final syncManager = SyncManager<TestDatabase>(

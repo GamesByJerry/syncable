@@ -770,6 +770,62 @@ class SyncManager<T extends SyncableDatabase> {
     return marked;
   }
 
+  /// Marks every non-locked row of [circleId] in encryption-registered
+  /// tables for re-push WITHOUT bumping `updated_at` — the re-encrypt sweep
+  /// direction (MC-430): after a promotion to enforced mode the re-pushes
+  /// null the backend's plaintext columns and attach the blob, and after a
+  /// key rotation they rewrite each row's blob under the new active key. In
+  /// both cases the *content* is unchanged, so `updated_at` must stay put:
+  /// other devices must not re-pull the circle, and a sweep re-push must
+  /// never win an LWW race against a genuine concurrent edit. Callers should
+  /// reconcile (pull) first to minimise the window where a re-push rewrites
+  /// a newer backend row this device has not pulled yet.
+  ///
+  /// Locked rows are skipped: their content fields are placeholders, never a
+  /// source for encryption — run [retryLockedRows] first if their key has
+  /// arrived.
+  ///
+  /// Rows are enqueued directly as well as marked dirty: their unchanged
+  /// `updated_at` typically sits behind the persisted push watermark, so the
+  /// regular local-change sweep alone would never pick them up (the same
+  /// reasoning as the deferred-push re-enqueue in [retryLockedRows]).
+  ///
+  /// Returns the number of rows marked for re-push.
+  Future<int> repushRowsForReencrypt({required String circleId}) async {
+    var marked = 0;
+    for (final syncable in _syncables) {
+      if (_encryption[syncable] == null) continue;
+      final table = _localTables[syncable]!;
+
+      final circleIdColumn =
+          table.columnsByName[circleIdKey] as GeneratedColumn<String>?;
+      if (circleIdColumn == null) continue;
+
+      final rows = await (_localDb.select(
+        table,
+      )..where((_) => circleIdColumn.equals(circleId))).get();
+      final outQueue = _outQueues[syncable]!;
+      for (final row in rows) {
+        if (row is EncryptedSyncable && row.locked) continue;
+        final companion =
+            _companions[syncable]!(dirty: const Value(true))
+                as UpdateCompanion<Syncable>;
+        await (_localDb.update(
+          table,
+        )..where((tbl) => tbl.id.equals(row.id))).write(companion);
+        outQueue[row.id] = row;
+        marked++;
+      }
+    }
+    if (marked > 0) {
+      _wake();
+      _logger.info(
+        'Marked $marked row(s) of circle $circleId for re-encrypt re-push',
+      );
+    }
+    return marked;
+  }
+
   Future _onDependenciesChanged(String reason) async {
     _maybeSubscribeToLocalChanges();
     _maybeSubscribeToBackendChanges();
