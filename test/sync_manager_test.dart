@@ -1784,27 +1784,29 @@ void main() {
       syncManager.dispose();
     });
 
-    test('an expired session counts as no session — the push is withheld',
-        () async {
-      // currentSession is non-null but expired: the access token can no longer
-      // authorize a write, so it is as good as anon.
-      when(mockSession.isExpired).thenReturn(true);
+    test(
+      'an expired session counts as no session — the push is withheld',
+      () async {
+        // currentSession is non-null but expired: the access token can no longer
+        // authorize a write, so it is as good as anon.
+        when(mockSession.isExpired).thenReturn(true);
 
-      final syncManager = buildManager();
-      final userId = const Uuid().v4();
-      syncManager.enableSync();
-      syncManager.setUserId(userId);
+        final syncManager = buildManager();
+        final userId = const Uuid().v4();
+        syncManager.enableSync();
+        syncManager.setUserId(userId);
 
-      await insertDirtyRow(userId);
-      await Future.delayed(const Duration(milliseconds: 150));
+        await insertDirtyRow(userId);
+        await Future.delayed(const Duration(milliseconds: 150));
 
-      verifyNever(
-        mockQueryBuilder.upsert(any, onConflict: anyNamed('onConflict')),
-      );
-      expect(syncManager.nSyncedToBackend(Item), 0);
+        verifyNever(
+          mockQueryBuilder.upsert(any, onConflict: anyNamed('onConflict')),
+        );
+        expect(syncManager.nSyncedToBackend(Item), 0);
 
-      syncManager.dispose();
-    });
+        syncManager.dispose();
+      },
+    );
 
     test('rows withheld while session-less flush as soon as a session goes '
         'live (auth-event wake)', () async {
@@ -1976,7 +1978,11 @@ void main() {
       final quarantined = await (testDb.select(
         testDb.items,
       )..where((t) => t.id.equals(id))).getSingle();
-      expect(quarantined.dirty, isTrue, reason: 'row is quarantined, still dirty');
+      expect(
+        quarantined.dirty,
+        isTrue,
+        reason: 'row is quarantined, still dirty',
+      );
 
       // A real auth context arrives. Clearing the quarantine lets the row retry,
       // and the backend now accepts it.
