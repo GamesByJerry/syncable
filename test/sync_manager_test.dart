@@ -47,6 +47,9 @@ void main() {
   late MockSupabaseQueryBuilder mockQueryBuilder;
   late MockClient mockHttpClient;
   late MockRealtimeChannel mockRealtimeChannel;
+  late MockGoTrueClient mockGoTrue;
+  late MockSession mockSession;
+  late StreamController<AuthState> authEvents;
 
   setUp(() {
     testDb = TestDatabase(
@@ -60,6 +63,18 @@ void main() {
     mockSupabaseClient = MockSupabaseClient();
     mockQueryBuilder = MockSupabaseQueryBuilder();
     mockHttpClient = MockClient();
+
+    // Auth context (MC-442): the engine refuses to push while there is no live
+    // Supabase session, since session-less pushes go out as `anon` and RLS
+    // rejects valid rows with 42501. Default to a LIVE session so the existing
+    // sync tests behave as before; the session-gate tests below override this.
+    mockGoTrue = MockGoTrueClient();
+    mockSession = MockSession();
+    authEvents = StreamController<AuthState>.broadcast();
+    when(mockSupabaseClient.auth).thenReturn(mockGoTrue);
+    when(mockGoTrue.currentSession).thenReturn(mockSession);
+    when(mockGoTrue.onAuthStateChange).thenAnswer((_) => authEvents.stream);
+    // mockSession.isExpired defaults to false (NiceMock bool) → a live session.
 
     final realQueryBuilder = PostgrestQueryBuilder(
       url: Uri(),
@@ -117,6 +132,7 @@ void main() {
   });
 
   tearDown(() async {
+    await authEvents.close();
     await testDb.close();
   });
 
@@ -1695,6 +1711,290 @@ void main() {
         contains(contains('syncing is disabled')),
         reason: 'the state should still be visible as a breadcrumb',
       );
+    });
+  });
+
+  group('Session gate (MC-442 Phase 2)', () {
+    // On cold start the local user is restored before the Supabase client
+    // finishes exchanging the refresh token, so a push that wins that race goes
+    // out as `anon`: auth.uid() is null, circle-scoped RLS rejects valid rows
+    // with 42501, and the engine used to quarantine them for the session. The
+    // engine now defends itself: it never pushes without a live session, treats
+    // a session-less 42501 as transient, and clears outgoing quarantines when a
+    // real auth context arrives.
+
+    SyncManager<TestDatabase> buildManager() {
+      final syncManager = SyncManager<TestDatabase>(
+        localDatabase: testDb,
+        supabaseClient: mockSupabaseClient,
+        syncInterval: const Duration(milliseconds: 1),
+      );
+      syncManager.registerSyncable<Item>(
+        backendTable: itemsTable,
+        fromJson: Item.fromJson,
+        companionConstructor: ItemsCompanion.new,
+      );
+      return syncManager;
+    }
+
+    Future<String> insertDirtyRow(String userId, {String? name}) async {
+      final id = const Uuid().v4();
+      await testDb
+          .into(testDb.items)
+          .insert(
+            ItemsCompanion(
+              id: drift.Value(id),
+              userId: drift.Value(userId),
+              updatedAt: drift.Value(DateTime.now()),
+              deleted: const drift.Value(false),
+              name: drift.Value(name ?? 'Gated'),
+            ),
+          );
+      return id;
+    }
+
+    test('a dirty row is NOT pushed while there is no live session — it is '
+        'withheld, not quarantined', () async {
+      // No session: every push would land as anon and get RLS-rejected.
+      when(mockGoTrue.currentSession).thenReturn(null);
+
+      final syncManager = buildManager();
+      final userId = const Uuid().v4();
+      syncManager.enableSync();
+      syncManager.setUserId(userId);
+
+      final id = await insertDirtyRow(userId);
+
+      // Give the loop ample passes to (wrongly) push if the gate were missing.
+      await Future.delayed(const Duration(milliseconds: 150));
+
+      verifyNever(
+        mockQueryBuilder.upsert(any, onConflict: anyNamed('onConflict')),
+      );
+      final row = await (testDb.select(
+        testDb.items,
+      )..where((t) => t.id.equals(id))).getSingle();
+      expect(
+        row.dirty,
+        isTrue,
+        reason: 'row must stay dirty (withheld), never dropped',
+      );
+      expect(syncManager.nSyncedToBackend(Item), 0);
+
+      syncManager.dispose();
+    });
+
+    test('an expired session counts as no session — the push is withheld',
+        () async {
+      // currentSession is non-null but expired: the access token can no longer
+      // authorize a write, so it is as good as anon.
+      when(mockSession.isExpired).thenReturn(true);
+
+      final syncManager = buildManager();
+      final userId = const Uuid().v4();
+      syncManager.enableSync();
+      syncManager.setUserId(userId);
+
+      await insertDirtyRow(userId);
+      await Future.delayed(const Duration(milliseconds: 150));
+
+      verifyNever(
+        mockQueryBuilder.upsert(any, onConflict: anyNamed('onConflict')),
+      );
+      expect(syncManager.nSyncedToBackend(Item), 0);
+
+      syncManager.dispose();
+    });
+
+    test('rows withheld while session-less flush as soon as a session goes '
+        'live (auth-event wake)', () async {
+      when(mockGoTrue.currentSession).thenReturn(null);
+
+      final syncManager = buildManager();
+      final userId = const Uuid().v4();
+      syncManager.enableSync();
+      syncManager.setUserId(userId);
+
+      final id = await insertDirtyRow(userId);
+
+      // Withheld so far.
+      await Future.delayed(const Duration(milliseconds: 80));
+      final before = await (testDb.select(
+        testDb.items,
+      )..where((t) => t.id.equals(id))).getSingle();
+      expect(before.dirty, isTrue, reason: 'still withheld, no session yet');
+
+      // The refresh-token exchange completes: a live session lands and the
+      // client fires signedIn. The withheld row must now flush.
+      when(mockGoTrue.currentSession).thenReturn(mockSession);
+      authEvents.add(AuthState(AuthChangeEvent.signedIn, mockSession));
+
+      await waitForFunctionToPass(() async {
+        final row = await (testDb.select(
+          testDb.items,
+        )..where((t) => t.id.equals(id))).getSingle();
+        expect(row.dirty, isFalse, reason: 'row flushed once session was live');
+      });
+
+      syncManager.dispose();
+    });
+
+    test('a 42501 reached after the session drops mid-push is retried, never '
+        'quarantined', () async {
+      // The gate passes (session live), the push goes out, but the session is
+      // gone by the time the verdict lands — so this 42501 was decided without a
+      // live auth context and says nothing about the row. It must be retried
+      // when a session returns, NOT quarantined for the session. The backend
+      // keeps rejecting with 42501 while there is no session (every attempt,
+      // batch or per-row fallback), and only accepts once a session is back —
+      // so a quarantine at v1 would strand the row forever (no auth event here
+      // to clear it), while a retry flushes it.
+      var sessionRestored = false;
+      var rejections = 0;
+      when(
+        mockHttpClient.post(
+          any,
+          headers: anyNamed('headers'),
+          body: anyNamed('body'),
+        ),
+      ).thenAnswer((inv) async {
+        final body = inv.namedArguments[#body] as String;
+        final rows = (jsonDecode(body) as List).cast<Map<String, dynamic>>();
+        if (!sessionRestored) {
+          // Drop the session mid-push: the verdict below is reached as anon.
+          when(mockGoTrue.currentSession).thenReturn(null);
+          rejections++;
+          return Response(
+            jsonEncode({
+              'code': '42501',
+              'message': 'new row violates row-level security policy',
+              'details': null,
+              'hint': null,
+            }),
+            403,
+            request: Request('POST', Uri()),
+            headers: {'content-type': 'application/json; charset=utf-8'},
+          );
+        }
+        return Response(
+          jsonEncode(rows),
+          200,
+          request: Request('POST', Uri()),
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        );
+      });
+
+      final syncManager = buildManager();
+      final userId = const Uuid().v4();
+      syncManager.enableSync();
+      syncManager.setUserId(userId);
+
+      final id = await insertDirtyRow(userId);
+
+      // At least one session-less 42501 was reached, and the row is still dirty.
+      await waitForFunctionToPass(() async {
+        expect(rejections, greaterThanOrEqualTo(1));
+      });
+      final stillDirty = await (testDb.select(
+        testDb.items,
+      )..where((t) => t.id.equals(id))).getSingle();
+      expect(stillDirty.dirty, isTrue, reason: 'not yet flushed (no session)');
+
+      // Manual recovery restores the session WITHOUT a fresh auth event, so the
+      // only thing that can flush the row is change #2 (retry, not quarantine).
+      // If the engine had quarantined it at v1, it would never flush here.
+      sessionRestored = true;
+      when(mockGoTrue.currentSession).thenReturn(mockSession);
+
+      await waitForFunctionToPass(() async {
+        final row = await (testDb.select(
+          testDb.items,
+        )..where((t) => t.id.equals(id))).getSingle();
+        expect(
+          row.dirty,
+          isFalse,
+          reason: 'session-less 42501 was retried, not quarantined',
+        );
+      });
+      expect(
+        rejections,
+        greaterThanOrEqualTo(1),
+        reason: 'the row really was rejected while session-less, then retried',
+      );
+
+      syncManager.dispose();
+    });
+
+    test('a signedIn event clears the outgoing quarantine so a row rejected '
+        'without real auth gets another chance', () async {
+      // A row is quarantined while the session reads live (a genuine-looking
+      // 42501). A verdict reached before a real auth context says nothing about
+      // the row, so a fresh signedIn must clear the quarantine and let it retry;
+      // here the backend accepts it once auth has "arrived", proving the
+      // quarantine was cleared (a still-versioned quarantine would never flush).
+      var authArrived = false;
+      when(
+        mockHttpClient.post(
+          any,
+          headers: anyNamed('headers'),
+          body: anyNamed('body'),
+        ),
+      ).thenAnswer((inv) async {
+        final body = inv.namedArguments[#body] as String;
+        final rows = (jsonDecode(body) as List).cast<Map<String, dynamic>>();
+        if (!authArrived) {
+          return Response(
+            jsonEncode({
+              'code': '42501',
+              'message': 'new row violates row-level security policy',
+              'details': null,
+              'hint': null,
+            }),
+            403,
+            request: Request('POST', Uri()),
+            headers: {'content-type': 'application/json; charset=utf-8'},
+          );
+        }
+        return Response(
+          jsonEncode(rows),
+          200,
+          request: Request('POST', Uri()),
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        );
+      });
+
+      final syncManager = buildManager();
+      final userId = const Uuid().v4();
+      syncManager.enableSync();
+      syncManager.setUserId(userId);
+
+      final id = await insertDirtyRow(userId);
+
+      // It gets pushed, rejected (42501), and quarantined — it must NOT keep
+      // retrying at the same version, so it stays dirty.
+      await Future.delayed(const Duration(milliseconds: 150));
+      final quarantined = await (testDb.select(
+        testDb.items,
+      )..where((t) => t.id.equals(id))).getSingle();
+      expect(quarantined.dirty, isTrue, reason: 'row is quarantined, still dirty');
+
+      // A real auth context arrives. Clearing the quarantine lets the row retry,
+      // and the backend now accepts it.
+      authArrived = true;
+      authEvents.add(AuthState(AuthChangeEvent.signedIn, mockSession));
+
+      await waitForFunctionToPass(() async {
+        final row = await (testDb.select(
+          testDb.items,
+        )..where((t) => t.id.equals(id))).getSingle();
+        expect(
+          row.dirty,
+          isFalse,
+          reason: 'quarantine cleared on signedIn; row flushed',
+        );
+      });
+
+      syncManager.dispose();
     });
   });
 }

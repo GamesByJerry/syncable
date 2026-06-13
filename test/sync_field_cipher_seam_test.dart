@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 
 import 'package:drift/drift.dart' as drift;
@@ -43,6 +44,9 @@ void main() {
   late MockSupabaseQueryBuilder mockQueryBuilder;
   late MockClient mockHttpClient;
   late MockRealtimeChannel mockRealtimeChannel;
+  late MockGoTrueClient mockGoTrue;
+  late MockSession mockSession;
+  late StreamController<AuthState> authEvents;
 
   /// Bodies of every upsert POST that reached the (mock) backend, in order.
   late List<List<Map<String, dynamic>>> pushedBatches;
@@ -69,6 +73,15 @@ void main() {
     mockSupabaseClient = MockSupabaseClient();
     mockQueryBuilder = MockSupabaseQueryBuilder();
     mockHttpClient = MockClient();
+
+    // A live session by default so the engine's session gate (MC-442) lets
+    // pushes through; these tests are about the cipher seam, not auth.
+    mockGoTrue = MockGoTrueClient();
+    mockSession = MockSession();
+    authEvents = StreamController<AuthState>.broadcast();
+    when(mockSupabaseClient.auth).thenReturn(mockGoTrue);
+    when(mockGoTrue.currentSession).thenReturn(mockSession);
+    when(mockGoTrue.onAuthStateChange).thenAnswer((_) => authEvents.stream);
 
     final realQueryBuilder = PostgrestQueryBuilder(
       url: Uri(),
@@ -133,6 +146,7 @@ void main() {
   });
 
   tearDown(() async {
+    await authEvents.close();
     await testDb.close();
   });
 
