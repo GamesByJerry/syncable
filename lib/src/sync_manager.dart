@@ -301,6 +301,10 @@ class SyncManager<T extends SyncableDatabase> {
 
   void dispose() {
     _disposed = true;
+    // Some paths (_syncTables, _maybeSubscribe*) read the RAW __syncingEnabled
+    // flag rather than the _disposed-aware getter, so clear it too: nothing must
+    // start a sweep or (re)subscribe after dispose.
+    __syncingEnabled = false;
     // Unpark the loop so it observes _disposed and exits promptly instead of
     // lingering until the backstop timer fires.
     _wake();
@@ -508,18 +512,35 @@ class SyncManager<T extends SyncableDatabase> {
     }
   }
 
+  /// Liveness of the LAST auth event observed — so [_onAuthStateChanged] acts
+  /// only on a genuine no-session -> live transition, not on every live event.
+  bool _hadLiveSession = false;
+
   /// Reacts to Supabase auth-state changes (MC-442).
   ///
-  /// When a live session arrives (signedIn / tokenRefreshed / the restored
-  /// initialSession), any outgoing quarantine reached beforehand could be a
-  /// false `anon` rejection — a 42501 on a valid row because `auth.uid()` was
-  /// null. Clear them all: a genuinely poison row simply re-quarantines on its
-  /// next attempt, while the false rejections get a real retry. Then wake the
-  /// loop to drain pushes the session gate withheld. A signed-out / expired
-  /// state is ignored — there is nothing safe to push.
+  /// Only a transition from no-session to a LIVE session can resolve an `anon`
+  /// artifact: it is the moment the cold-start refresh-token exchange completes
+  /// (signedIn / tokenRefreshed / the restored initialSession — whichever the
+  /// client fires). At that instant any outgoing quarantine reached beforehand
+  /// could be a false `anon` rejection (42501 on a valid row because
+  /// `auth.uid()` was null), so clear them — a genuinely poison row simply
+  /// re-quarantines on its next attempt — and re-sweep / wake to drain the
+  /// pushes the session gate withheld.
+  ///
+  /// A REPEAT live event (e.g. a periodic tokenRefreshed while already signed
+  /// in) is deliberately a no-op: the session was already live, so any
+  /// quarantine reached under it is a GENUINE rejection — re-clearing it would
+  /// just re-push and re-quarantine a poison row and re-log a severe every
+  /// refresh. A signed-out / expired event is ignored too (nothing safe to
+  /// push); it just re-arms the transition.
   void _onAuthStateChanged(AuthState state) {
+    if (_disposed) return;
+
     final session = state.session;
-    if (session == null || session.isExpired) return;
+    final nowLive = session != null && !session.isExpired;
+    final wasLive = _hadLiveSession;
+    _hadLiveSession = nowLive;
+    if (!nowLive || wasLive) return;
 
     var cleared = 0;
     for (final quarantined in _outgoingQuarantined.values) {

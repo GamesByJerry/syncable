@@ -1927,13 +1927,16 @@ void main() {
       syncManager.dispose();
     });
 
-    test('a signedIn event clears the outgoing quarantine so a row rejected '
-        'without real auth gets another chance', () async {
-      // A row is quarantined while the session reads live (a genuine-looking
-      // 42501). A verdict reached before a real auth context says nothing about
-      // the row, so a fresh signedIn must clear the quarantine and let it retry;
-      // here the backend accepts it once auth has "arrived", proving the
-      // quarantine was cleared (a still-versioned quarantine would never flush).
+    test('the no-session -> live transition clears outgoing quarantines so a '
+        'previously-rejected row retries', () async {
+      // The session is LIVE the whole time, so the 42501 is a GENUINE rejection
+      // that quarantines (not an anon artifact). This proves the OTHER half of
+      // the defence: the first live-session event (here signedIn) clears ALL
+      // outgoing quarantines and re-sweeps — safe even for genuine rejections,
+      // because a still-poison row just re-quarantines. Here the backend starts
+      // accepting once auth has "arrived", so the row flushes — which can only
+      // happen if the quarantine was actually cleared (a still-versioned
+      // quarantine would never flush).
       var authArrived = false;
       when(
         mockHttpClient.post(
@@ -1997,6 +2000,99 @@ void main() {
           row.dirty,
           isFalse,
           reason: 'quarantine cleared on signedIn; row flushed',
+        );
+      });
+
+      syncManager.dispose();
+    });
+
+    test('a repeat live event (tokenRefreshed while already live) does NOT '
+        're-clear a genuine quarantine — only a no-session -> live transition '
+        'does', () async {
+      // The session is live throughout. A quarantine reached under a live
+      // session is GENUINE, so a periodic tokenRefreshed (the session was
+      // already live) must not keep clearing + re-pushing it — that would
+      // re-quarantine a poison row and re-log a severe on every refresh. Only a
+      // real no-session -> live transition clears.
+      var accept = false;
+      when(
+        mockHttpClient.post(
+          any,
+          headers: anyNamed('headers'),
+          body: anyNamed('body'),
+        ),
+      ).thenAnswer((inv) async {
+        final body = inv.namedArguments[#body] as String;
+        final rows = (jsonDecode(body) as List).cast<Map<String, dynamic>>();
+        if (!accept) {
+          return Response(
+            jsonEncode({
+              'code': '42501',
+              'message': 'new row violates row-level security policy',
+              'details': null,
+              'hint': null,
+            }),
+            403,
+            request: Request('POST', Uri()),
+            headers: {'content-type': 'application/json; charset=utf-8'},
+          );
+        }
+        return Response(
+          jsonEncode(rows),
+          200,
+          request: Request('POST', Uri()),
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        );
+      });
+
+      final syncManager = buildManager();
+      final userId = const Uuid().v4();
+      syncManager.enableSync();
+      syncManager.setUserId(userId);
+      final id = await insertDirtyRow(userId);
+
+      // Quarantined under a live session (a genuine 42501).
+      await waitForFunctionToPass(() async {
+        final row = await (testDb.select(
+          testDb.items,
+        )..where((t) => t.id.equals(id))).getSingle();
+        expect(row.dirty, isTrue);
+      });
+
+      // First live event = a transition: clears, retries, re-quarantines (the
+      // backend still rejects while !accept).
+      authEvents.add(AuthState(AuthChangeEvent.signedIn, mockSession));
+      await Future.delayed(const Duration(milliseconds: 120));
+
+      // The backend would now accept the row — but a token refresh while the
+      // session is ALREADY live must NOT re-clear the quarantine, so the row
+      // stays withheld (still dirty). Were it cleared, it would flush here.
+      accept = true;
+      authEvents.add(AuthState(AuthChangeEvent.tokenRefreshed, mockSession));
+      await Future.delayed(const Duration(milliseconds: 150));
+      final afterRefresh = await (testDb.select(
+        testDb.items,
+      )..where((t) => t.id.equals(id))).getSingle();
+      expect(
+        afterRefresh.dirty,
+        isTrue,
+        reason:
+            'a token refresh while already live must not re-clear quarantine',
+      );
+
+      // A genuine no-session -> live transition DOES clear it, so the row then
+      // flushes (proving it was only the quarantine holding it, not a wedge).
+      authEvents.add(const AuthState(AuthChangeEvent.signedOut, null));
+      authEvents.add(AuthState(AuthChangeEvent.signedIn, mockSession));
+      await waitForFunctionToPass(() async {
+        final row = await (testDb.select(
+          testDb.items,
+        )..where((t) => t.id.equals(id))).getSingle();
+        expect(
+          row.dirty,
+          isFalse,
+          reason:
+              'a fresh transition clears the quarantine and the row flushes',
         );
       });
 
