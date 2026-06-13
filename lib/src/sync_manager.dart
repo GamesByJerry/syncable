@@ -89,7 +89,19 @@ class SyncManager<T extends SyncableDatabase> {
        assert(
          syncInterval.inMilliseconds > 0,
          'Sync interval must be positive',
-       );
+       ) {
+    // MC-442: watch the auth context so the engine reacts the instant a real
+    // session lands — draining pushes the session gate withheld and clearing
+    // any outgoing quarantine that was reached without a live session.
+    _authStateSubscription = _supabaseClient.auth.onAuthStateChange.listen(
+      _onAuthStateChanged,
+      // A broken auth stream must not surface as an unhandled zone error; the
+      // session gate still defends pushes either way (it reads currentSession
+      // directly), so log and carry on.
+      onError: (Object e, StackTrace s) =>
+          _logger.warning('Auth state stream error: $e', e, s),
+    );
+  }
 
   final _logger = Logger('syncable');
 
@@ -109,6 +121,20 @@ class SyncManager<T extends SyncableDatabase> {
   bool get syncingEnabled => __syncingEnabled;
   bool get _syncingEnabled =>
       __syncingEnabled && !_disposed && userId.isNotEmpty;
+
+  /// Live subscription to the Supabase auth stream — see [_onAuthStateChanged].
+  StreamSubscription<AuthState>? _authStateSubscription;
+
+  /// Whether the Supabase client currently holds a usable auth context: a
+  /// non-null, non-expired session. PostgREST treats a session-less (or
+  /// expired-token) request as `anon` — `auth.uid()` is null, circle-scoped RLS
+  /// matches nothing, and a perfectly valid row is rejected with 42501 (MC-442).
+  /// The engine reads this straight off the client so it is self-defending: it
+  /// never pushes as `anon`, no matter how the host app drives it.
+  bool get _hasLiveSession {
+    final session = _supabaseClient.auth.currentSession;
+    return session != null && !session.isExpired;
+  }
 
   /// Enables syncing for all registered syncables.
   ///
@@ -275,9 +301,14 @@ class SyncManager<T extends SyncableDatabase> {
 
   void dispose() {
     _disposed = true;
+    // Some paths (_syncTables, _maybeSubscribe*) read the RAW __syncingEnabled
+    // flag rather than the _disposed-aware getter, so clear it too: nothing must
+    // start a sweep or (re)subscribe after dispose.
+    __syncingEnabled = false;
     // Unpark the loop so it observes _disposed and exits promptly instead of
     // lingering until the backstop timer fires.
     _wake();
+    _authStateSubscription?.cancel();
     _resubscribeTimer?.cancel();
     for (final subscription in _localSubscriptions.values) {
       subscription.cancel();
@@ -481,6 +512,59 @@ class SyncManager<T extends SyncableDatabase> {
     }
   }
 
+  /// Liveness of the LAST auth event observed — so [_onAuthStateChanged] acts
+  /// only on a genuine no-session -> live transition, not on every live event.
+  bool _hadLiveSession = false;
+
+  /// Reacts to Supabase auth-state changes (MC-442).
+  ///
+  /// Only a transition from no-session to a LIVE session can resolve an `anon`
+  /// artifact: it is the moment the cold-start refresh-token exchange completes
+  /// (signedIn / tokenRefreshed / the restored initialSession — whichever the
+  /// client fires). At that instant any outgoing quarantine reached beforehand
+  /// could be a false `anon` rejection (42501 on a valid row because
+  /// `auth.uid()` was null), so clear them — a genuinely poison row simply
+  /// re-quarantines on its next attempt — and re-sweep / wake to drain the
+  /// pushes the session gate withheld.
+  ///
+  /// A REPEAT live event (e.g. a periodic tokenRefreshed while already signed
+  /// in) is deliberately a no-op: the session was already live, so any
+  /// quarantine reached under it is a GENUINE rejection — re-clearing it would
+  /// just re-push and re-quarantine a poison row and re-log a severe every
+  /// refresh. A signed-out / expired event is ignored too (nothing safe to
+  /// push); it just re-arms the transition.
+  void _onAuthStateChanged(AuthState state) {
+    if (_disposed) return;
+
+    final session = state.session;
+    final nowLive = session != null && !session.isExpired;
+    final wasLive = _hadLiveSession;
+    _hadLiveSession = nowLive;
+    if (!nowLive || wasLive) return;
+
+    var cleared = 0;
+    for (final quarantined in _outgoingQuarantined.values) {
+      cleared += quarantined.length;
+      quarantined.clear();
+    }
+
+    if (cleared > 0) {
+      _logger.info(
+        'Cleared $cleared outgoing quarantine(s) on ${state.event}: a verdict '
+        'reached without a live session says nothing about the row',
+      );
+      // A cleared row was already drained from the out-queue when it was
+      // quarantined, so re-read dirty rows to re-queue it (the sweep wakes the
+      // loop once it enqueues). Only needed when something was actually cleared;
+      // a fire-and-forget sweep like the other dependency-change callers.
+      _onDependenciesChanged('outgoing quarantine cleared on ${state.event}');
+    } else {
+      // Pushes the session gate withheld are still in the out-queue — just drain
+      // them now that a real session exists.
+      _wake();
+    }
+  }
+
   /// Parks the loop until there is work to do. Returns immediately if a queue
   /// already holds items — this closes the missed-wake race where an item is
   /// enqueued between a drain finishing and the loop parking. Otherwise it waits
@@ -488,7 +572,12 @@ class SyncManager<T extends SyncableDatabase> {
   /// [_syncInterval] backstop timer, whichever fires first.
   Future<void> _idle() async {
     if (_disposed) return;
-    if (isSyncingToBackend || isSyncingFromBackend) return;
+    // A backed-up out-queue only counts as actionable work when we can actually
+    // push it — i.e. there is a live session. Without one the engine withholds
+    // the push (MC-442), so don't let the full queue keep the loop spinning;
+    // park and let the auth-state listener wake us the instant a session lands
+    // (the backstop timer re-checks meanwhile).
+    if ((isSyncingToBackend && _hasLiveSession) || isSyncingFromBackend) return;
 
     final signal = _wakeSignal = Completer<void>();
     final backstop = Timer(_syncInterval, () {
@@ -1664,12 +1753,38 @@ class SyncManager<T extends SyncableDatabase> {
   /// We parse [code] as an int and treat it as transient only for a real HTTP
   /// status (429, or 5xx below 600). The `< 600` guard stops a 5-digit SQLSTATE
   /// like 23505 from being misread as ">= 500".
+  ///
+  /// A 42501 (RLS) is permanent ONLY with a live session; one reached without a
+  /// session is an `anon` artifact — see [_isSessionlessRlsRejection].
   static bool _isTransientPostgrest(PostgrestException e) {
     final status = int.tryParse(e.code ?? '');
     return status != null && (status == 429 || (status >= 500 && status < 600));
   }
 
+  /// PostgREST SQLSTATE for a row-level-security rejection.
+  static const String _rlsViolationCode = '42501';
+
+  /// True when [e] is an RLS rejection (42501) reached WITHOUT a live session.
+  ///
+  /// A session-less request is `anon`: `auth.uid()` is null, circle-scoped RLS
+  /// matches nothing, and even a perfectly valid row is rejected with 42501
+  /// (MC-442). That verdict says nothing about the row, so it must be retried
+  /// once a real auth context lands — never quarantined. With a live session a
+  /// 42501 is a genuine authorization failure and stays permanent (quarantined).
+  /// The session is read fresh at verdict time, so a token that dropped between
+  /// the gate check and the push round-trip is caught here.
+  bool _isSessionlessRlsRejection(PostgrestException e) =>
+      e.code == _rlsViolationCode && !_hasLiveSession;
+
   Future<void> _processOutgoing(Type syncable) async {
+    // MC-442: never push without a live Supabase session. A session-less push
+    // goes out as `anon`; circle-scoped RLS rejects valid rows with 42501 and
+    // the engine would quarantine them for the session. Leave the out-queue
+    // untouched and skip — the auth-state listener wakes the loop the instant a
+    // session lands (and the idle backstop re-checks meanwhile), so the held
+    // rows flush rather than being lost or quarantined.
+    if (!_hasLiveSession) return;
+
     final outQueue = _outQueues[syncable]!;
     final backendTable = _backendTables[syncable]!;
     final quarantined = _outgoingQuarantined[syncable]!;
@@ -1723,16 +1838,19 @@ class SyncManager<T extends SyncableDatabase> {
         await _upsertPayloads(backendTable, encoded.values);
         await _markPushed(syncable, encoded.keys.toSet());
       } on PostgrestException catch (batchError) {
-        if (_isTransientPostgrest(batchError)) {
-          // PostgREST reports rate limits (429) and server errors (5xx) as
-          // PostgrestExceptions too. Those are transient: re-enqueue the WHOLE
-          // batch and back off — never fall through to per-row, which would
-          // quarantine healthy rows over a passing backend hiccup (MC-424 §B/§C).
+        if (_isTransientPostgrest(batchError) ||
+            _isSessionlessRlsRejection(batchError)) {
+          // Transient (429/5xx), OR a 42501 reached without a live session: the
+          // session dropped between the gate check and the round-trip, so the
+          // whole batch went out as `anon` and the rejection is an auth artifact,
+          // not a real verdict (MC-442). Either way re-enqueue the WHOLE batch
+          // and back off — never fall through to per-row, which would quarantine
+          // healthy rows over a passing hiccup or an anon rejection (MC-424 §B/§C).
           for (final row in encoded.keys) {
             _enqueueKeepingNewest(outQueue, row);
           }
           _logger.warning(
-            'Transient PostgrestException pushing to $backendTable '
+            'Re-enqueuing batch to $backendTable after a retryable rejection '
             '($batchError); will retry',
           );
           return;
@@ -1755,9 +1873,12 @@ class SyncManager<T extends SyncableDatabase> {
             await _upsertPayloads(backendTable, [encoded[row]!]);
             succeeded.add(row);
           } on PostgrestException catch (rowError, rowStack) {
-            if (_isTransientPostgrest(rowError)) {
-              // Transient (rate limit / server error) mid-fallback — keep for
-              // retry; do NOT quarantine over a passing backend failure.
+            if (_isTransientPostgrest(rowError) ||
+                _isSessionlessRlsRejection(rowError)) {
+              // Transient (rate limit / server error), or a 42501 reached after
+              // the session dropped mid-fallback (an `anon` artifact, MC-442) —
+              // keep for retry; do NOT quarantine over a passing backend failure
+              // or a verdict reached without a live auth context.
               retry.add(row);
             } else {
               // Permanent rejection of this specific row. Quarantine at this

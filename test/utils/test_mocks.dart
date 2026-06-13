@@ -6,4 +6,6 @@ import 'package:supabase/supabase.dart';
 @GenerateNiceMocks([MockSpec<SupabaseQueryBuilder>()])
 @GenerateNiceMocks([MockSpec<RealtimeChannel>()])
 @GenerateNiceMocks([MockSpec<Client>()])
+@GenerateNiceMocks([MockSpec<GoTrueClient>()])
+@GenerateNiceMocks([MockSpec<Session>()])
 void main() {}
