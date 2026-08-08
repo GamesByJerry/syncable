@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:math';
 
 import 'package:collection/collection.dart';
 import 'package:drift/drift.dart';
@@ -67,6 +68,13 @@ class SyncManager<T extends SyncableDatabase> {
   /// [onEncryptionAlert] callback receives encryption events the app should
   /// report — severities split tampering (critical) from key availability
   /// (info); see [SyncEncryptionAlert].
+  ///
+  /// The optional [random] source supplies jitter for realtime resubscribe
+  /// delays. It is exposed so callers can provide a deterministic source in
+  /// tests; normal callers should use the default.
+  ///
+  /// The optional [timerFactory] is the timer source for realtime
+  /// resubscribe delays. It is primarily useful for deterministic tests.
   SyncManager({
     required T localDatabase,
     required SupabaseClient supabaseClient,
@@ -77,6 +85,8 @@ class SyncManager<T extends SyncableDatabase> {
     Duration reconcileOverlap = const Duration(seconds: 10),
     SyncFieldCipher? fieldCipher,
     void Function(SyncEncryptionAlert alert)? onEncryptionAlert,
+    Random? random,
+    Timer Function(Duration, void Function())? timerFactory,
   }) : _localDb = localDatabase,
        _supabaseClient = supabaseClient,
        _syncInterval = syncInterval,
@@ -86,6 +96,8 @@ class SyncManager<T extends SyncableDatabase> {
        _reconcileOverlap = reconcileOverlap,
        _fieldCipher = fieldCipher,
        _onEncryptionAlert = onEncryptionAlert,
+       _random = random ?? Random(),
+       _timerFactory = timerFactory ?? Timer.new,
        assert(
          syncInterval.inMilliseconds > 0,
          'Sync interval must be positive',
@@ -114,6 +126,8 @@ class SyncManager<T extends SyncableDatabase> {
   final Duration _reconcileOverlap;
   final SyncFieldCipher? _fieldCipher;
   final void Function(SyncEncryptionAlert alert)? _onEncryptionAlert;
+  final Random _random;
+  final Timer Function(Duration, void Function()) _timerFactory;
 
   /// This is what gets set when [enableSync] gets called. Internally, whether
   /// the syncing is enabled or not is determined by [_syncingEnabled].
@@ -210,6 +224,7 @@ class SyncManager<T extends SyncableDatabase> {
 
   final Map<Type, TableInfo<SyncableTable, Syncable>> _localTables = {};
   final Map<Type, String> _backendTables = {};
+  final Map<Type, bool> _liveUpdates = {};
 
   final Map<Type, Syncable Function(Map<String, dynamic>)> _fromJsons = {};
   final Map<Type, CompanionConstructor> _companions = {};
@@ -285,6 +300,17 @@ class SyncManager<T extends SyncableDatabase> {
   /// Debounces rebuilding the backend channel after an unexpected drop so a
   /// persistently failing socket can't spin in a tight resubscribe loop.
   Timer? _resubscribeTimer;
+  int _resubscribeAttempts = 0;
+
+  static const _maxResubscribeDelay = Duration(minutes: 5);
+
+  /// Tracks an in-flight sweep so reconnect backfills can skip duplicate work.
+  /// This is deliberately skip-not-queue, matching the app-side
+  /// `_reconcileInFlight` precedent: there is no watchdog, so a hung sweep can
+  /// keep reconnect backfills skipped until it completes; disposal's syncing-
+  /// disabled short-circuit prevents any new work, and the periodic reconcile
+  /// remains the recovery path afterwards.
+  bool _sweepRunning = false;
 
   /// The number of items of type [syncable] that have been synced to the
   /// backend.
@@ -310,6 +336,8 @@ class SyncManager<T extends SyncableDatabase> {
     _wake();
     _authStateSubscription?.cancel();
     _resubscribeTimer?.cancel();
+    _resubscribeTimer = null;
+    _resubscribeAttempts = 0;
     for (final subscription in _localSubscriptions.values) {
       subscription.cancel();
     }
@@ -334,6 +362,9 @@ class SyncManager<T extends SyncableDatabase> {
   /// merged back on pull. See [SyncEncryption] for the requirements on the
   /// model, the table, and the backend schema.
   ///
+  /// Set [liveUpdates] to false to omit this table from the realtime channel.
+  /// The table remains part of normal reconcile sweeps.
+  ///
   /// The generic type parameter must be provided and must be a  concrete
   /// subclass of [Syncable].
   void registerSyncable<S extends Syncable>({
@@ -341,6 +372,7 @@ class SyncManager<T extends SyncableDatabase> {
     required Syncable Function(Map<String, dynamic>) fromJson,
     required CompanionConstructor companionConstructor,
     SyncEncryption? encryption,
+    bool liveUpdates = true,
   }) {
     if (S == Syncable) {
       throw Exception(
@@ -370,6 +402,7 @@ class SyncManager<T extends SyncableDatabase> {
     _syncables.add(S);
     _localTables[S] = table;
     _backendTables[S] = backendTable;
+    _liveUpdates[S] = liveUpdates;
     _fromJsons[S] = fromJson;
     _companions[S] = companionConstructor;
     if (encryption != null) _encryption[S] = encryption;
@@ -957,11 +990,7 @@ class SyncManager<T extends SyncableDatabase> {
               as UpdateCompanion<Syncable>;
       await _localDb.batch((batch) {
         for (final row in toMark) {
-          batch.update(
-            table,
-            companion,
-            where: (tbl) => tbl.id.equals(row.id),
-          );
+          batch.update(table, companion, where: (tbl) => tbl.id.equals(row.id));
         }
       });
       final outQueue = _outQueues[syncable]!;
@@ -1104,12 +1133,20 @@ class SyncManager<T extends SyncableDatabase> {
 
   void _maybeSubscribeToBackendChanges() {
     final otherDevicesActive = _otherDevicesActive();
+    final hasLiveUpdates = _syncables.any(
+      (syncable) => _liveUpdates[syncable] ?? true,
+    );
 
-    if (!_syncingEnabled || !otherDevicesActive) {
+    if (!_syncingEnabled || !otherDevicesActive || !hasLiveUpdates) {
       if (_backendSubscription != null) {
         _backendSubscription?.unsubscribe();
         _backendSubscription = null;
       }
+      _resubscribeTimer?.cancel();
+      _resubscribeTimer = null;
+      // A disabled/solo/no-live-updates state is an intentional teardown. A
+      // later legitimate subscription should start with a fresh backoff.
+      _resubscribeAttempts = 0;
 
       String reason;
       var expected = true;
@@ -1118,6 +1155,8 @@ class SyncManager<T extends SyncableDatabase> {
         reason = 'syncing is disabled';
       } else if (userId.isEmpty) {
         reason = 'the user ID is empty';
+      } else if (!hasLiveUpdates) {
+        reason = 'no registered syncable has live updates';
       } else if (!otherDevicesActive) {
         reason = 'no other devices are active';
       } else {
@@ -1138,11 +1177,16 @@ class SyncManager<T extends SyncableDatabase> {
     if (_backendSubscription != null) {
       return;
     }
+    if (_resubscribeTimer?.isActive ?? false) {
+      return;
+    }
 
     final channel = _supabaseClient.channel('backend_changes');
     _backendSubscription = channel;
 
-    for (final syncable in _syncables) {
+    for (final syncable in _syncables.where(
+      (syncable) => _liveUpdates[syncable] ?? true,
+    )) {
       channel.onPostgresChanges(
         schema: publicSchema,
         table: _backendTables[syncable],
@@ -1177,8 +1221,17 @@ class SyncManager<T extends SyncableDatabase> {
   ) {
     switch (status) {
       case RealtimeSubscribeStatus.subscribed:
+        if (!identical(channel, _backendSubscription)) return;
         _resubscribeTimer?.cancel();
+        _resubscribeTimer = null;
+        _resubscribeAttempts = 0;
         _logger.info('Subscribed to backend changes');
+        if (_sweepRunning) {
+          _logger.info(
+            'Realtime (re)connect backfill skipped — sweep already in flight',
+          );
+          return;
+        }
         // Backfill whatever realtime could not deliver while (re)connecting.
         // Fire-and-forget, but guard so a failed reconcile can't surface as an
         // unhandled async error from this realtime callback.
@@ -1215,7 +1268,22 @@ class SyncManager<T extends SyncableDatabase> {
   void _scheduleBackendResubscribe() {
     if (_disposed) return;
     if (_resubscribeTimer?.isActive ?? false) return;
-    _resubscribeTimer = Timer(_syncInterval, () {
+    final attempts = ++_resubscribeAttempts;
+    var delay = _syncInterval;
+    for (var i = 1; i < attempts && delay < _maxResubscribeDelay; i++) {
+      // Keep the first value beyond the cap: jitter it before clamping so the
+      // retries that cross the cap do not collapse onto one exact delay.
+      delay *= 2;
+    }
+
+    // Keep a failing backend from receiving synchronized retry bursts. Jitter
+    // the uncapped exponential delay first, then clamp the result to five
+    // minutes so retries remain decorrelated when the ladder reaches the cap.
+    final jittered = delay * (0.75 + _random.nextDouble() * 0.5);
+    delay = jittered > _maxResubscribeDelay ? _maxResubscribeDelay : jittered;
+
+    _resubscribeTimer = _timerFactory(delay, () {
+      _resubscribeTimer = null;
       if (_disposed) return;
       _maybeSubscribeToBackendChanges();
     });
@@ -1245,6 +1313,18 @@ class SyncManager<T extends SyncableDatabase> {
   }
 
   Future<void> _syncTables(String reason, {bool fullResync = false}) async {
+    _sweepRunning = true;
+    try {
+      await _performSyncTables(reason, fullResync: fullResync);
+    } finally {
+      _sweepRunning = false;
+    }
+  }
+
+  Future<void> _performSyncTables(
+    String reason, {
+    required bool fullResync,
+  }) async {
     // Expected idle states (signed out / pre-login), not faults: INFO so they
     // stay visible as breadcrumbs without becoming a Sentry capture on every
     // signed-out launch (MC-424 §E).
