@@ -221,6 +221,25 @@ recently active.
 Set `otherDevicesConsideredInactiveAfter` when instantiating the sync manager to
 adjust for how long devices should be considered active after their last ping.
 
+#### Opt out of realtime updates for selected tables
+
+Set `liveUpdates: false` when registering a syncable that does not need
+per-row realtime notifications:
+
+```dart
+syncManager.registerSyncable<ArchiveItem>(
+  backendTable: 'archive_items',
+  fromJson: ArchiveItem.fromJson,
+  companionConstructor: ArchiveItemsCompanion.new,
+  liveUpdates: false,
+);
+```
+
+This avoids binding that table to the realtime channel and is useful for large,
+slow-changing, or low-priority tables. The table is still reconciled by normal
+manual and dependency-triggered sweeps. If every registered table opts out, no
+realtime channel is created.
+
 #### Persistently store synchronization timestamps
 
 By default, a full sync between local and backend tables is performed every time

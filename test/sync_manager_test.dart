@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:math';
 
 import 'package:drift/drift.dart' as drift;
 import 'package:drift/native.dart' as drift_native;
@@ -40,6 +41,98 @@ class LocalReturningTimestampStorage extends TimestampStorage {
       super.getSyncTimestamp(key)?.toLocal();
 }
 
+class FixedRandom implements Random {
+  FixedRandom(this.value);
+
+  final double value;
+
+  @override
+  bool nextBool() => value >= 0.5;
+
+  @override
+  double nextDouble() => value;
+
+  @override
+  int nextInt(int max) => (value * max).floor().clamp(0, max - 1);
+}
+
+class FakeTimer implements Timer {
+  FakeTimer(this.duration, this.callback);
+
+  final Duration duration;
+  final void Function() callback;
+  bool _isActive = true;
+  int _tick = 0;
+
+  @override
+  bool get isActive => _isActive;
+
+  @override
+  int get tick => _tick;
+
+  @override
+  void cancel() => _isActive = false;
+
+  void fire() {
+    if (!_isActive) return;
+    _isActive = false;
+    _tick++;
+    callback();
+  }
+}
+
+class FakeTimerFactory {
+  final timers = <FakeTimer>[];
+
+  Timer call(Duration duration, void Function() callback) {
+    final timer = FakeTimer(duration, callback);
+    timers.add(timer);
+    return timer;
+  }
+}
+
+/// PostgREST 2.9 executes through [Client.send], while the suite's transport
+/// stubs intentionally live on the stable verb methods. Keep that test seam
+/// consistent across both PostgREST transport shapes.
+class VerbDelegatingMockClient extends MockClient {
+  Future<Response> Function(Uri uri, Map<String, String> headers)? onGet;
+
+  @override
+  Future<Response> get(Uri? url, {Map<String, String>? headers}) {
+    final handler = onGet;
+    if (handler != null) return handler(url!, headers ?? const {});
+    return super.get(url, headers: headers);
+  }
+
+  @override
+  Future<StreamedResponse> send(BaseRequest? request) async {
+    if (request == null) throw ArgumentError('Request must not be null');
+    late Response response;
+    switch (request.method) {
+      case 'GET':
+        response = await get(request.url, headers: request.headers);
+      case 'POST':
+        response = await super.post(
+          request.url,
+          headers: request.headers,
+          body: request is Request ? request.body : null,
+          encoding: utf8,
+        );
+      default:
+        throw UnsupportedError(
+          'Test client does not support ${request.method}',
+        );
+    }
+    return StreamedResponse(
+      Stream<List<int>>.value(response.bodyBytes),
+      response.statusCode,
+      headers: response.headers,
+      request: request,
+      reasonPhrase: response.reasonPhrase,
+    );
+  }
+}
+
 void main() {
   late TestDatabase testDb;
 
@@ -62,7 +155,7 @@ void main() {
     // Set up mocks for Supabase to allow upserting things
     mockSupabaseClient = MockSupabaseClient();
     mockQueryBuilder = MockSupabaseQueryBuilder();
-    mockHttpClient = MockClient();
+    mockHttpClient = VerbDelegatingMockClient();
 
     // Auth context (MC-442): the engine refuses to push while there is no live
     // Supabase session, since session-less pushes go out as `anon` and RLS
@@ -97,6 +190,7 @@ void main() {
         any,
         headers: anyNamed('headers'),
         body: anyNamed('body'),
+        encoding: anyNamed('encoding'),
       ),
     ).thenAnswer(
       (_) async => Response(
@@ -114,7 +208,6 @@ void main() {
       (_) async =>
           Response(jsonEncode([]), 200, request: Request('GET', Uri())),
     );
-
     // Set up mocks for Supabase to allow listening to changes in the database
     mockRealtimeChannel = MockRealtimeChannel();
     when(mockSupabaseClient.channel(any)).thenReturn(mockRealtimeChannel);
@@ -193,6 +286,7 @@ void main() {
         any,
         headers: anyNamed('headers'),
         body: anyNamed('body'),
+        encoding: anyNamed('encoding'),
       ),
     ).thenAnswer((inv) async {
       final body = inv.namedArguments[#body] as String;
@@ -292,6 +386,7 @@ void main() {
           any,
           headers: anyNamed('headers'),
           body: anyNamed('body'),
+          encoding: anyNamed('encoding'),
         ),
       ).thenAnswer((inv) async {
         final body = inv.namedArguments[#body] as String;
@@ -379,6 +474,7 @@ void main() {
         any,
         headers: anyNamed('headers'),
         body: anyNamed('body'),
+        encoding: anyNamed('encoding'),
       ),
     ).thenAnswer((inv) async {
       final body = inv.namedArguments[#body] as String;
@@ -485,6 +581,7 @@ void main() {
         any,
         headers: anyNamed('headers'),
         body: anyNamed('body'),
+        encoding: anyNamed('encoding'),
       ),
     ).thenAnswer((inv) async {
       final body = inv.namedArguments[#body] as String;
@@ -1102,6 +1199,65 @@ void main() {
     expect(syncManager.syncables, equals([Item]));
   });
 
+  test(
+    'does not create a realtime channel when live updates are disabled',
+    () async {
+      final syncManager = SyncManager<TestDatabase>(
+        localDatabase: testDb,
+        supabaseClient: mockSupabaseClient,
+        syncInterval: const Duration(milliseconds: 1),
+      );
+      addTearDown(syncManager.dispose);
+      syncManager.registerSyncable<Item>(
+        backendTable: itemsTable,
+        fromJson: Item.fromJson,
+        companionConstructor: ItemsCompanion.new,
+        liveUpdates: false,
+      );
+
+      syncManager.setUserId(const Uuid().v4());
+      syncManager.enableSync();
+      await Future<void>.delayed(Duration.zero);
+
+      verifyNever(mockSupabaseClient.channel(any));
+      expect(syncManager.isSubscribedToBackend, isFalse);
+    },
+  );
+
+  test('binds only syncables with live updates enabled', () async {
+    final syncManager = SyncManager<TestDatabase>(
+      localDatabase: testDb,
+      supabaseClient: mockSupabaseClient,
+      syncInterval: const Duration(milliseconds: 1),
+    );
+    addTearDown(syncManager.dispose);
+    syncManager.registerSyncable<Item>(
+      backendTable: itemsTable,
+      fromJson: Item.fromJson,
+      companionConstructor: ItemsCompanion.new,
+      liveUpdates: false,
+    );
+    syncManager.registerSyncable<SecretItem>(
+      backendTable: secretItemsTable,
+      fromJson: SecretItem.fromJson,
+      companionConstructor: SecretItemsCompanion.new,
+    );
+
+    syncManager.setUserId(const Uuid().v4());
+    syncManager.enableSync();
+    await Future<void>.delayed(Duration.zero);
+
+    final subscribedTables = verify(
+      mockRealtimeChannel.onPostgresChanges(
+        schema: anyNamed('schema'),
+        table: captureAnyNamed('table'),
+        event: anyNamed('event'),
+        callback: anyNamed('callback'),
+      ),
+    ).captured;
+    expect(subscribedTables, [secretItemsTable]);
+  });
+
   // MC-413 item 1: event-driven queue draining. The loop must drain on a wake
   // signal from the two enqueue sites, not only on its backstop timer. A long
   // `syncInterval` makes the distinction observable: if the loop still relied on
@@ -1420,12 +1576,16 @@ void main() {
   group('Realtime reconnect', () {
     SyncManager<TestDatabase> buildManager({
       Duration inactiveAfter = const Duration(minutes: 2),
+      Random? random,
+      FakeTimerFactory? timerFactory,
     }) {
       final syncManager = SyncManager<TestDatabase>(
         localDatabase: testDb,
         supabaseClient: mockSupabaseClient,
         syncInterval: const Duration(milliseconds: 1),
         otherDevicesConsideredInactiveAfter: inactiveAfter,
+        random: random,
+        timerFactory: timerFactory?.call,
       );
       syncManager.registerSyncable<Item>(
         backendTable: itemsTable,
@@ -1434,6 +1594,60 @@ void main() {
       );
       return syncManager;
     }
+
+    test(
+      'skips reconnect backfill while a sweep is already in flight',
+      () async {
+        final transport = mockHttpClient as VerbDelegatingMockClient;
+
+        void Function(RealtimeSubscribeStatus, Object?)? statusCallback;
+        when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
+          statusCallback =
+              inv.positionalArguments.first
+                  as void Function(RealtimeSubscribeStatus, Object?)?;
+          return mockRealtimeChannel;
+        });
+
+        final syncManager = buildManager();
+        addTearDown(syncManager.dispose);
+        syncManager.setUserId(const Uuid().v4());
+        syncManager.enableSync();
+
+        // setUserId and enableSync can each request a startup sweep. Wait for
+        // those dependency-triggered sweeps to quiesce before gating the
+        // explicit sweep used by this test.
+        await waitForFunctionToPass(() async {
+          final count = syncManager.nFullSyncs;
+          await Future<void>.delayed(const Duration(milliseconds: 30));
+          expect(syncManager.nFullSyncs, count);
+        });
+
+        final leadingResponse = Completer<Response>();
+        final leadingStarted = Completer<void>();
+        var metadataGetCount = 0;
+        transport.onGet = (uri, _) {
+          metadataGetCount++;
+          if (metadataGetCount == 1) {
+            leadingStarted.complete();
+            return leadingResponse.future;
+          }
+          return Future.value(
+            Response(jsonEncode([]), 200, request: Request('GET', uri)),
+          );
+        };
+
+        final leadingSweep = syncManager.syncTables();
+        await leadingStarted.future;
+        expect(statusCallback, isNotNull);
+        statusCallback!(RealtimeSubscribeStatus.subscribed, null);
+
+        leadingResponse.complete(
+          Response(jsonEncode([]), 200, request: Request('GET', Uri())),
+        );
+        await leadingSweep;
+        expect(metadataGetCount, 1);
+      },
+    );
 
     test('A (re)connect forces a reconcile to backfill missed events', () async {
       void Function(RealtimeSubscribeStatus, Object?)? statusCb;
@@ -1495,6 +1709,198 @@ void main() {
       syncManager.dispose();
     });
 
+    test('resubscribe delays grow exponentially across consecutive drops', () {
+      final callbacks = <void Function(RealtimeSubscribeStatus, Object?)?>[];
+      var subscribeCount = 0;
+      final timers = FakeTimerFactory();
+      when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
+        subscribeCount++;
+        callbacks.add(
+          inv.positionalArguments.first
+              as void Function(RealtimeSubscribeStatus, Object?)?,
+        );
+        return mockRealtimeChannel;
+      });
+
+      final syncManager = SyncManager<TestDatabase>(
+        localDatabase: testDb,
+        supabaseClient: mockSupabaseClient,
+        syncInterval: const Duration(milliseconds: 50),
+        random: FixedRandom(0.5),
+        timerFactory: timers.call,
+      );
+      addTearDown(syncManager.dispose);
+      syncManager.registerSyncable<Item>(
+        backendTable: itemsTable,
+        fromJson: Item.fromJson,
+        companionConstructor: ItemsCompanion.new,
+      );
+      syncManager.setUserId(const Uuid().v4());
+      syncManager.enableSync();
+
+      expect(subscribeCount, 1);
+      callbacks[0]!(RealtimeSubscribeStatus.channelError, Exception('first'));
+      expect(timers.timers.single.duration, const Duration(milliseconds: 50));
+      timers.timers.single.fire();
+      expect(subscribeCount, 2);
+
+      callbacks[1]!(RealtimeSubscribeStatus.channelError, Exception('second'));
+      expect(timers.timers[1].duration, const Duration(milliseconds: 100));
+      timers.timers[1].fire();
+      expect(subscribeCount, 3);
+    });
+
+    test('a successful subscribe resets the next retry to the base delay', () {
+      final callbacks = <void Function(RealtimeSubscribeStatus, Object?)?>[];
+      var subscribeCount = 0;
+      final timers = FakeTimerFactory();
+      when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
+        subscribeCount++;
+        callbacks.add(
+          inv.positionalArguments.first
+              as void Function(RealtimeSubscribeStatus, Object?)?,
+        );
+        return mockRealtimeChannel;
+      });
+
+      final syncManager = SyncManager<TestDatabase>(
+        localDatabase: testDb,
+        supabaseClient: mockSupabaseClient,
+        syncInterval: const Duration(milliseconds: 50),
+        random: FixedRandom(0.5),
+        timerFactory: timers.call,
+      );
+      addTearDown(syncManager.dispose);
+      syncManager.registerSyncable<Item>(
+        backendTable: itemsTable,
+        fromJson: Item.fromJson,
+        companionConstructor: ItemsCompanion.new,
+      );
+      syncManager.setUserId(const Uuid().v4());
+      syncManager.enableSync();
+
+      expect(subscribeCount, 1);
+      callbacks[0]!(RealtimeSubscribeStatus.channelError, Exception('first'));
+      timers.timers[0].fire();
+      expect(subscribeCount, 2);
+      callbacks[1]!(RealtimeSubscribeStatus.channelError, Exception('second'));
+      timers.timers[1].fire();
+      expect(subscribeCount, 3);
+
+      callbacks[2]!(RealtimeSubscribeStatus.subscribed, null);
+      callbacks[2]!(RealtimeSubscribeStatus.channelError, Exception('third'));
+      expect(timers.timers[2].duration, const Duration(milliseconds: 50));
+      timers.timers[2].fire();
+      expect(subscribeCount, 4);
+    });
+
+    test('jitter uses both bounds and clamps only after jittering', () {
+      final callbacks = <void Function(RealtimeSubscribeStatus, Object?)?>[];
+      when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
+        callbacks.add(
+          inv.positionalArguments.first
+              as void Function(RealtimeSubscribeStatus, Object?)?,
+        );
+        return mockRealtimeChannel;
+      });
+
+      var timers = FakeTimerFactory();
+      SyncManager<TestDatabase> makeManager(double randomValue) {
+        final syncManager = SyncManager<TestDatabase>(
+          localDatabase: testDb,
+          supabaseClient: mockSupabaseClient,
+          syncInterval: const Duration(milliseconds: 5),
+          random: FixedRandom(randomValue),
+          timerFactory: timers.call,
+        );
+        addTearDown(syncManager.dispose);
+        syncManager.registerSyncable<Item>(
+          backendTable: itemsTable,
+          fromJson: Item.fromJson,
+          companionConstructor: ItemsCompanion.new,
+        );
+        syncManager.setUserId(const Uuid().v4());
+        syncManager.enableSync();
+        return syncManager;
+      }
+
+      void driveToCap() {
+        // 5 ms * 2^26 crosses the five-minute cap. Fire every fake retry
+        // leading up to that crossing without waiting on elapsed wall time.
+        for (var i = 1; i <= 25; i++) {
+          callbacks[i]!(
+            RealtimeSubscribeStatus.channelError,
+            Exception('drop $i'),
+          );
+          timers.timers[i].fire();
+        }
+        callbacks[26]!(RealtimeSubscribeStatus.channelError, Exception('cap'));
+      }
+
+      makeManager(0.0);
+      callbacks[0]!(RealtimeSubscribeStatus.channelError, Exception('low'));
+      expect(
+        timers.timers[0].duration.inMicroseconds,
+        inInclusiveRange(
+          const Duration(milliseconds: 3).inMicroseconds,
+          const Duration(milliseconds: 4).inMicroseconds,
+        ),
+      );
+      timers.timers[0].fire();
+      driveToCap();
+      expect(
+        timers.timers[26].duration,
+        greaterThan(const Duration(minutes: 4)),
+      );
+      expect(timers.timers[26].duration, lessThan(const Duration(minutes: 5)));
+
+      callbacks.clear();
+      timers = FakeTimerFactory();
+      makeManager(1.0);
+      callbacks[0]!(RealtimeSubscribeStatus.channelError, Exception('high'));
+      expect(
+        timers.timers[0].duration.inMicroseconds,
+        inInclusiveRange(
+          const Duration(milliseconds: 6).inMicroseconds,
+          const Duration(milliseconds: 7).inMicroseconds,
+        ),
+      );
+      timers.timers[0].fire();
+      driveToCap();
+      expect(timers.timers[26].duration, const Duration(minutes: 5));
+    });
+
+    test('a pending retry cannot be bypassed by a dependency change', () {
+      var subscribeCount = 0;
+      final callbacks = <void Function(RealtimeSubscribeStatus, Object?)?>[];
+      final timers = FakeTimerFactory();
+      when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
+        subscribeCount++;
+        callbacks.add(
+          inv.positionalArguments.first
+              as void Function(RealtimeSubscribeStatus, Object?)?,
+        );
+        return mockRealtimeChannel;
+      });
+
+      final syncManager = buildManager(
+        random: FixedRandom(0.5),
+        timerFactory: timers,
+      );
+      addTearDown(syncManager.dispose);
+      syncManager.setUserId(const Uuid().v4());
+      syncManager.enableSync();
+      expect(subscribeCount, 1);
+
+      callbacks[0]!(RealtimeSubscribeStatus.channelError, Exception('drop'));
+      syncManager.setLastTimeOtherDeviceWasActive(DateTime.now().toUtc());
+      expect(subscribeCount, 1);
+      expect(timers.timers.single.isActive, isTrue);
+
+      timers.timers.single.fire();
+      expect(subscribeCount, 2);
+    });
+
     test('A drop is ignored once we no longer want a subscription', () async {
       var subscribeCount = 0;
       void Function(RealtimeSubscribeStatus, Object?)? statusCb;
@@ -1528,6 +1934,46 @@ void main() {
       expect(subscribeCount, countAfterTeardown);
 
       syncManager.dispose();
+    });
+
+    test('intentional teardown resets the next retry backoff', () {
+      final callbacks = <void Function(RealtimeSubscribeStatus, Object?)?>[];
+      var subscribeCount = 0;
+      when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
+        subscribeCount++;
+        callbacks.add(
+          inv.positionalArguments.first
+              as void Function(RealtimeSubscribeStatus, Object?)?,
+        );
+        return mockRealtimeChannel;
+      });
+
+      final timers = FakeTimerFactory();
+      final syncManager = buildManager(
+        inactiveAfter: const Duration(seconds: 1),
+        random: FixedRandom(0.5),
+        timerFactory: timers,
+      );
+      addTearDown(syncManager.dispose);
+      syncManager.setUserId(const Uuid().v4());
+      syncManager.enableSync();
+      expect(subscribeCount, 1);
+
+      callbacks[0]!(RealtimeSubscribeStatus.channelError, Exception('drop'));
+      expect(timers.timers[0].duration, const Duration(milliseconds: 1));
+
+      syncManager.setLastTimeOtherDeviceWasActive(
+        DateTime.now().subtract(const Duration(seconds: 2)).toUtc(),
+      );
+      expect(syncManager.isSubscribedToBackend, isFalse);
+      expect(timers.timers[0].isActive, isFalse);
+
+      syncManager.setLastTimeOtherDeviceWasActive(DateTime.now().toUtc());
+      expect(subscribeCount, 2);
+      callbacks[1]!(RealtimeSubscribeStatus.channelError, Exception('new'));
+      expect(timers.timers[1].duration, const Duration(milliseconds: 1));
+      timers.timers[1].fire();
+      expect(subscribeCount, 3);
     });
   });
 
@@ -1653,6 +2099,7 @@ void main() {
           any,
           headers: anyNamed('headers'),
           body: anyNamed('body'),
+          encoding: anyNamed('encoding'),
         ),
       ).thenAnswer(
         (_) async =>
@@ -1858,6 +2305,7 @@ void main() {
           any,
           headers: anyNamed('headers'),
           body: anyNamed('body'),
+          encoding: anyNamed('encoding'),
         ),
       ).thenAnswer((inv) async {
         final body = inv.namedArguments[#body] as String;
@@ -1943,6 +2391,7 @@ void main() {
           any,
           headers: anyNamed('headers'),
           body: anyNamed('body'),
+          encoding: anyNamed('encoding'),
         ),
       ).thenAnswer((inv) async {
         final body = inv.namedArguments[#body] as String;
@@ -2020,6 +2469,7 @@ void main() {
           any,
           headers: anyNamed('headers'),
           body: anyNamed('body'),
+          encoding: anyNamed('encoding'),
         ),
       ).thenAnswer((inv) async {
         final body = inv.namedArguments[#body] as String;
