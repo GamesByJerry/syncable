@@ -9,7 +9,7 @@ s = s.replace(
     "       assert(\n         syncInterval.inMilliseconds > 0,\n         'Sync interval must be positive',\n       ),\n       assert(!reconcileOverlap.isNegative, 'Reconcile overlap cannot be negative') {",
     1,
 )
-s = s.replace('Error.throwWithStackTrace(firstError!, firstStack!);', 'Error.throwWithStackTrace(firstError, firstStack);')
+s = s.replace('Error.throwWithStackTrace(firstError!, firstStack!);', 'Error.throwWithStackTrace(firstError, firstStack!);')
 s = s.replace(
     "  Future<List<Map<String, dynamic>>> _fetchBackendItemMetadata(\n    Type syncable, {\n    bool fullResync = false,\n  }) async {",
     "  Future<List<Map<String, dynamic>>> _fetchBackendItemMetadata(\n    Type syncable,\n  ) async {",
