@@ -32,12 +32,12 @@ mixin SyncableDatabase on GeneratedDatabase {
     });
   }
 
-  /// Subscribes to [table] and listens for changes in it.
+  /// Subscribes to [table] and listens for rows matching [filter].
   ///
-  /// On each change, rows get filtered with [filter] and then passed to
-  /// [onChange].
-  ///
-  /// The table for a syncable can be retrieved using [getTable].
+  /// Drift emits the complete result set whenever the query is invalidated, so
+  /// callers should make [filter] as selective as possible. SyncManager uses
+  /// [subscribeToDirty] for outgoing discovery so a one-row edit does not
+  /// materialize the table's accumulated history.
   StreamSubscription<List<T>> subscribe<T extends Syncable>({
     required TableInfo<SyncableTable, T> table,
     required Expression<bool> Function(SyncableTable) filter,
@@ -53,9 +53,22 @@ mixin SyncableDatabase on GeneratedDatabase {
 
     final stream = _queryStreams[(table, filter)]! as Stream<List<T>>;
 
-    return stream.listen((rows) {
-      onChange(rows);
-    });
+    return stream.listen(onChange);
+  }
+
+  /// Watches only rows whose persistent dirty flag is set.
+  ///
+  /// This is the normal outgoing-sync subscription. Filtering in SQL avoids
+  /// repeatedly materializing clean history merely to discard it in Dart.
+  StreamSubscription<List<T>> subscribeToDirty<T extends Syncable>({
+    required TableInfo<SyncableTable, T> table,
+    required void Function(List<T>) onChange,
+  }) {
+    return subscribe(
+      table: table,
+      filter: (row) => row.dirty.equals(true),
+      onChange: onChange,
+    );
   }
 
   /// Retrieves the table for a specific syncable type [T].
