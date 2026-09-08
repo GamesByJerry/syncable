@@ -81,6 +81,10 @@ void main() {
     authEvents = StreamController<AuthState>.broadcast();
     when(mockSupabaseClient.auth).thenReturn(mockGoTrue);
     when(mockGoTrue.currentSession).thenReturn(mockSession);
+    // Session is deliberately live in this suite. Mockito's generated fallback
+    // for an unstubbed bool getter is false today, but make the contract explicit
+    // so auth-gate behavior cannot silently change with mock generation.
+    when(mockSession.isExpired).thenReturn(false);
     when(mockGoTrue.onAuthStateChange).thenAnswer((_) => authEvents.stream);
 
     final realQueryBuilder = PostgrestQueryBuilder(
@@ -120,15 +124,32 @@ void main() {
     when(mockQueryBuilder.select(any)).thenAnswer(
       (inv) => realQueryBuilder.select(inv.positionalArguments[0] as String),
     );
-    // Serve [backendRows] to both the id/updated_at metadata sweep and the
-    // full-row batch pull (the sweep only reads the id/updated_at keys).
-    when(mockHttpClient.get(any, headers: anyNamed('headers'))).thenAnswer(
-      (_) async => Response(
-        jsonEncode(backendRows),
+    // Current PostgREST executes requests through BaseClient.send(). Preserve
+    // the suite's original semantics: GETs read [backendRows], POSTs record the
+    // exact upsert payload and echo it back as a successful response.
+    when(mockHttpClient.send(any)).thenAnswer((invocation) async {
+      final request = invocation.positionalArguments[0] as BaseRequest;
+      if (request.method == 'POST') {
+        final body = (request as Request).body;
+        pushedBatches.add(
+          (jsonDecode(body) as List).cast<Map<String, dynamic>>(),
+        );
+        return StreamedResponse(
+          Stream<List<int>>.value(utf8.encode(body)),
+          200,
+          request: request,
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        );
+      }
+
+      final bytes = utf8.encode(jsonEncode(backendRows));
+      return StreamedResponse(
+        Stream<List<int>>.value(bytes),
         200,
-        request: Request('GET', Uri()),
-      ),
-    );
+        request: request,
+        headers: {'content-type': 'application/json; charset=utf-8'},
+      );
+    });
 
     mockRealtimeChannel = MockRealtimeChannel();
     when(mockSupabaseClient.channel(any)).thenReturn(mockRealtimeChannel);
@@ -306,25 +327,29 @@ void main() {
       (inv) => realQueryBuilder.select(inv.positionalArguments[0] as String),
     );
     var itemsPushStarted = false;
-    when(
-      mockHttpClient.post(
-        any,
-        headers: anyNamed('headers'),
-        body: anyNamed('body'),
-      ),
-    ).thenAnswer((inv) async {
-      final body = inv.namedArguments[#body] as String;
-      final rows = (jsonDecode(body) as List).cast<Map<String, dynamic>>();
-      if (rows.isNotEmpty && rows.first.containsKey(nameKey)) {
-        itemsPushStarted = true;
-        await Future<void>.delayed(const Duration(milliseconds: 250));
-      } else {
-        pushedBatches.add(rows);
+    when(mockHttpClient.send(any)).thenAnswer((invocation) async {
+      final request = invocation.positionalArguments[0] as BaseRequest;
+      if (request.method == 'POST') {
+        final body = (request as Request).body;
+        final rows = (jsonDecode(body) as List).cast<Map<String, dynamic>>();
+        if (rows.isNotEmpty && rows.first.containsKey(nameKey)) {
+          itemsPushStarted = true;
+          await Future<void>.delayed(const Duration(milliseconds: 250));
+        } else {
+          pushedBatches.add(rows);
+        }
+        return StreamedResponse(
+          Stream<List<int>>.value(utf8.encode(body)),
+          200,
+          request: request,
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        );
       }
-      return Response(
-        body,
+
+      return StreamedResponse(
+        Stream<List<int>>.value(utf8.encode(jsonEncode(backendRows))),
         200,
-        request: Request('POST', Uri()),
+        request: request,
         headers: {'content-type': 'application/json; charset=utf-8'},
       );
     });
@@ -1729,35 +1754,40 @@ void main() {
       // its per-row fallback) — modelling the enforced-mode plaintext guard
       // rejecting a stale shadow-shaped push.
       var failuresLeft = 2;
-      when(
-        mockHttpClient.post(
-          any,
-          headers: anyNamed('headers'),
-          body: anyNamed('body'),
-        ),
-      ).thenAnswer((inv) async {
-        final body = inv.namedArguments[#body] as String;
-        if (failuresLeft > 0) {
-          failuresLeft--;
-          return Response(
-            jsonEncode({
+      when(mockHttpClient.send(any)).thenAnswer((invocation) async {
+        final request = invocation.positionalArguments[0] as BaseRequest;
+        if (request.method == 'POST') {
+          final body = (request as Request).body;
+          if (failuresLeft > 0) {
+            failuresLeft--;
+            final errorBody = jsonEncode({
               'code': '42501',
               'message': 'E2E_PLAINTEXT_REJECTED: stale mode',
               'details': 'Forbidden',
               'hint': null,
-            }),
-            403,
-            request: Request('POST', Uri()),
+            });
+            return StreamedResponse(
+              Stream<List<int>>.value(utf8.encode(errorBody)),
+              403,
+              request: request,
+              headers: {'content-type': 'application/json; charset=utf-8'},
+            );
+          }
+          pushedBatches.add(
+            (jsonDecode(body) as List).cast<Map<String, dynamic>>(),
+          );
+          return StreamedResponse(
+            Stream<List<int>>.value(utf8.encode(body)),
+            200,
+            request: request,
             headers: {'content-type': 'application/json; charset=utf-8'},
           );
         }
-        pushedBatches.add(
-          (jsonDecode(body) as List).cast<Map<String, dynamic>>(),
-        );
-        return Response(
-          body,
+
+        return StreamedResponse(
+          Stream<List<int>>.value(utf8.encode(jsonEncode(backendRows))),
           200,
-          request: Request('POST', Uri()),
+          request: request,
           headers: {'content-type': 'application/json; charset=utf-8'},
         );
       });

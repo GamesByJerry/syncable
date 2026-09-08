@@ -5,7 +5,6 @@ import 'dart:math';
 import 'package:drift/drift.dart' as drift;
 import 'package:drift/native.dart' as drift_native;
 import 'package:http/http.dart';
-import 'package:logging/logging.dart';
 import 'package:mockito/mockito.dart';
 import 'package:supabase/supabase.dart';
 import 'package:syncable/src/supabase_names.dart';
@@ -34,13 +33,6 @@ class TimestampStorage extends SyncTimestampStorage {
 
 /// Hands back watermarks as *local* (non-UTC) DateTimes — a plausible custom
 /// storage (e.g. one that parses without forcing UTC). Used to prove the
-/// incremental metadata filter still serializes as UTC.
-class LocalReturningTimestampStorage extends TimestampStorage {
-  @override
-  DateTime? getSyncTimestamp(String key) =>
-      super.getSyncTimestamp(key)?.toLocal();
-}
-
 class FixedRandom implements Random {
   FixedRandom(this.value);
 
@@ -459,6 +451,95 @@ void main() {
         reason: 'row was retried past the transient 503s',
       );
 
+      syncManager.dispose();
+    },
+  );
+
+  test(
+    'transient push is timer-backed and re-enable does not create a second worker',
+    () async {
+      final timerFactory = FakeTimerFactory();
+      var attempts = 0;
+      when(
+        mockHttpClient.post(
+          any,
+          headers: anyNamed('headers'),
+          body: anyNamed('body'),
+          encoding: anyNamed('encoding'),
+        ),
+      ).thenAnswer((inv) async {
+        attempts++;
+        if (attempts == 1) {
+          return Response(
+            jsonEncode({
+              'code': '503',
+              'message': 'service temporarily unavailable',
+              'details': null,
+              'hint': null,
+            }),
+            503,
+            request: Request('POST', Uri()),
+            headers: {'content-type': 'application/json; charset=utf-8'},
+          );
+        }
+        return Response(
+          inv.namedArguments[#body] as String,
+          200,
+          request: Request('POST', Uri()),
+          headers: {'content-type': 'application/json; charset=utf-8'},
+        );
+      });
+
+      final syncManager = SyncManager<TestDatabase>(
+        localDatabase: testDb,
+        supabaseClient: mockSupabaseClient,
+        syncInterval: const Duration(seconds: 5),
+        random: FixedRandom(0.5),
+        timerFactory: timerFactory.call,
+      );
+      syncManager.registerSyncable<Item>(
+        backendTable: itemsTable,
+        fromJson: Item.fromJson,
+        companionConstructor: ItemsCompanion.new,
+      );
+      final userId = const Uuid().v4();
+      syncManager.setUserId(userId);
+      syncManager.enableSync();
+
+      await testDb
+          .into(testDb.items)
+          .insert(
+            ItemsCompanion(
+              id: drift.Value(const Uuid().v4()),
+              userId: drift.Value(userId),
+              updatedAt: drift.Value(DateTime.now()),
+              deleted: const drift.Value(false),
+              name: const drift.Value('retry me'),
+            ),
+          );
+
+      await waitForFunctionToPass(() async {
+        expect(attempts, 1);
+        expect(timerFactory.timers.where((timer) => timer.isActive).length, 1);
+      });
+
+      await Future<void>.delayed(const Duration(milliseconds: 10));
+      expect(
+        attempts,
+        1,
+        reason: 'queued row must stay parked until retry timer fires',
+      );
+
+      syncManager.disableSync();
+      syncManager.enableSync();
+      expect(attempts, 1, reason: 're-enable must not start another worker');
+
+      final retryTimer = timerFactory.timers.firstWhere(
+        (timer) => timer.isActive,
+      );
+      expect(retryTimer.duration, const Duration(seconds: 5));
+      retryTimer.fire();
+      await waitForFunctionToPass(() async => expect(attempts, 2));
       syncManager.dispose();
     },
   );
@@ -1408,756 +1489,45 @@ void main() {
     });
   });
 
-  // MC-413 item 4: incremental metadata fetch. The reconcile's id/updated_at
-  // sweep must be bounded to rows changed since the last pull, not the whole
-  // table — except the first pull (null watermark), which stays a full sweep.
-  group('Incremental metadata fetch', () {
+  // updated_at is conflict metadata, not an arrival cursor. Reconciliation
+  // therefore always fetches the complete RLS-visible id/timestamp projection.
+  group('Reconciliation metadata discovery', () {
     List<Uri> metadataGetUris() {
       final captured = verify(
         mockHttpClient.get(captureAny, headers: anyNamed('headers')),
       ).captured.cast<Uri>();
-      // The metadata sweep is the only query selecting `id,updated_at`.
-      return captured.where((u) => u.query.contains('select=id')).toList();
+      return captured
+          .where((uri) => uri.query.contains('select=id%2Cupdated_at'))
+          .toList();
     }
 
-    test('First sweep is full; later sweeps filter on updated_at', () async {
+    test('normal sweeps never filter discovery by updated_at', () async {
+      final storage = TimestampStorage();
       final syncManager = SyncManager<TestDatabase>(
         localDatabase: testDb,
         supabaseClient: mockSupabaseClient,
         syncInterval: const Duration(milliseconds: 1),
-        syncTimestampStorage: TimestampStorage(),
+        syncTimestampStorage: storage,
       );
       syncManager.registerSyncable<Item>(
         backendTable: itemsTable,
         fromJson: Item.fromJson,
         companionConstructor: ItemsCompanion.new,
       );
-
       syncManager.setUserId(const Uuid().v4());
       syncManager.enableSync();
 
-      // Force reconciles explicitly: the package loop only drains queues; full
-      // syncs come from dependency changes / explicit calls (the heartbeat that
-      // would drive them periodically lives in the app, not the package).
       await syncManager.syncTables();
       await syncManager.syncTables();
-      syncManager.dispose();
 
-      final metaUris = metadataGetUris();
-      expect(metaUris.length, greaterThanOrEqualTo(2));
-      // First pull: no stored watermark yet → unfiltered full sweep.
-      expect(metaUris.first.query, isNot(contains('updated_at=gt')));
-      // A later pull, once a watermark exists, is bounded by updated_at.
+      final uris = metadataGetUris();
+      expect(uris, isNotEmpty);
       expect(
-        metaUris.any((u) => u.query.contains('updated_at=gt.')),
+        uris.every((uri) => !uri.query.contains('updated_at=gt.')),
         isTrue,
-        reason: 'expected an incremental sweep filtered on updated_at',
-      );
-    });
-
-    test(
-      'Incremental filter is serialized as UTC even if storage is local',
-      () async {
-        // Guards the toUtc() on the watermark: a local DateTime would otherwise
-        // serialize without the 'Z' the backend needs (silent tz mismatch).
-        final syncManager = SyncManager<TestDatabase>(
-          localDatabase: testDb,
-          supabaseClient: mockSupabaseClient,
-          syncInterval: const Duration(milliseconds: 1),
-          syncTimestampStorage: LocalReturningTimestampStorage(),
-        );
-        syncManager.registerSyncable<Item>(
-          backendTable: itemsTable,
-          fromJson: Item.fromJson,
-          companionConstructor: ItemsCompanion.new,
-        );
-
-        syncManager.setUserId(const Uuid().v4());
-        syncManager.enableSync();
-        await syncManager.syncTables();
-        await syncManager.syncTables();
-        syncManager.dispose();
-
-        final gtUris = metadataGetUris()
-            .where((u) => u.query.contains('updated_at=gt.'))
-            .toList();
-        expect(gtUris, isNotEmpty);
-        for (final u in gtUris) {
-          final raw = Uri.decodeComponent(
-            u.query.split('updated_at=gt.')[1].split('&').first,
-          );
-          expect(
-            raw.endsWith('Z'),
-            isTrue,
-            reason: 'incremental filter not UTC-serialized: $raw',
-          );
-        }
-      },
-    );
-
-    test(
-      'A full-resync sweep ignores the watermark even when one exists',
-      () async {
-        // When the set of rows a client may read GROWS for a non-temporal
-        // reason — e.g. joining a circle whose rows (and the circle row itself)
-        // were last modified BEFORE this client's last pull — the incremental
-        // `updated_at > watermark` filter silently skips them: they are older
-        // than the watermark yet only just became visible. A forced full
-        // resync must drop the filter so those pre-existing rows are pulled.
-        final syncManager = SyncManager<TestDatabase>(
-          localDatabase: testDb,
-          supabaseClient: mockSupabaseClient,
-          syncInterval: const Duration(milliseconds: 1),
-          syncTimestampStorage: TimestampStorage(),
-        );
-        syncManager.registerSyncable<Item>(
-          backendTable: itemsTable,
-          fromJson: Item.fromJson,
-          companionConstructor: ItemsCompanion.new,
-        );
-
-        syncManager.setUserId(const Uuid().v4());
-        syncManager.enableSync();
-
-        // First sweep establishes a watermark; the second is incremental
-        // (filtered on updated_at) — proving a watermark now exists.
-        await syncManager.syncTables();
-        await syncManager.syncTables();
-        // The forced full resync must NOT carry the updated_at filter despite
-        // the stored watermark.
-        await syncManager.syncTables(fullResync: true);
-        syncManager.dispose();
-
-        final metaUris = metadataGetUris();
-        expect(
-          metaUris.any((u) => u.query.contains('updated_at=gt.')),
-          isTrue,
-          reason: 'a watermark-bounded incremental sweep must have happened',
-        );
-        expect(
-          metaUris.last.query,
-          isNot(contains('updated_at=gt')),
-          reason: 'the full-resync sweep must ignore the watermark',
-        );
-      },
-    );
-
-    test('Without a timestamp store every sweep stays a full sweep', () async {
-      // No syncTimestampStorage → no watermark can be persisted → the filter can
-      // never be applied, so behaviour must fall back to full sweeps.
-      final syncManager = SyncManager<TestDatabase>(
-        localDatabase: testDb,
-        supabaseClient: mockSupabaseClient,
-        syncInterval: const Duration(milliseconds: 1),
-      );
-      syncManager.registerSyncable<Item>(
-        backendTable: itemsTable,
-        fromJson: Item.fromJson,
-        companionConstructor: ItemsCompanion.new,
-      );
-
-      syncManager.setUserId(const Uuid().v4());
-      syncManager.enableSync();
-
-      await syncManager.syncTables();
-      await syncManager.syncTables();
-      syncManager.dispose();
-
-      final metaUris = metadataGetUris();
-      expect(metaUris.length, greaterThanOrEqualTo(2));
-      expect(metaUris.every((u) => !u.query.contains('updated_at=gt')), isTrue);
-    });
-  });
-
-  // MC-413 item 6: realtime reconnect robustness. A dropped channel must be
-  // resubscribed (a closed channel cannot be re-subscribed in place), and every
-  // (re)connect must force a reconcile to backfill events realtime missed while
-  // disconnected.
-  group('Realtime reconnect', () {
-    SyncManager<TestDatabase> buildManager({
-      Duration inactiveAfter = const Duration(minutes: 2),
-      Random? random,
-      FakeTimerFactory? timerFactory,
-    }) {
-      final syncManager = SyncManager<TestDatabase>(
-        localDatabase: testDb,
-        supabaseClient: mockSupabaseClient,
-        syncInterval: const Duration(milliseconds: 1),
-        otherDevicesConsideredInactiveAfter: inactiveAfter,
-        random: random,
-        timerFactory: timerFactory?.call,
-      );
-      syncManager.registerSyncable<Item>(
-        backendTable: itemsTable,
-        fromJson: Item.fromJson,
-        companionConstructor: ItemsCompanion.new,
-      );
-      return syncManager;
-    }
-
-    test(
-      'skips reconnect backfill while a sweep is already in flight',
-      () async {
-        final transport = mockHttpClient as VerbDelegatingMockClient;
-
-        void Function(RealtimeSubscribeStatus, Object?)? statusCallback;
-        when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
-          statusCallback =
-              inv.positionalArguments.first
-                  as void Function(RealtimeSubscribeStatus, Object?)?;
-          return mockRealtimeChannel;
-        });
-
-        final syncManager = buildManager();
-        addTearDown(syncManager.dispose);
-        syncManager.setUserId(const Uuid().v4());
-        syncManager.enableSync();
-
-        // setUserId and enableSync can each request a startup sweep. Wait for
-        // those dependency-triggered sweeps to quiesce before gating the
-        // explicit sweep used by this test.
-        await waitForFunctionToPass(() async {
-          final count = syncManager.nFullSyncs;
-          await Future<void>.delayed(const Duration(milliseconds: 30));
-          expect(syncManager.nFullSyncs, count);
-        });
-
-        final leadingResponse = Completer<Response>();
-        final leadingStarted = Completer<void>();
-        var metadataGetCount = 0;
-        transport.onGet = (uri, _) {
-          metadataGetCount++;
-          if (metadataGetCount == 1) {
-            leadingStarted.complete();
-            return leadingResponse.future;
-          }
-          return Future.value(
-            Response(jsonEncode([]), 200, request: Request('GET', uri)),
-          );
-        };
-
-        final leadingSweep = syncManager.syncTables();
-        await leadingStarted.future;
-        expect(statusCallback, isNotNull);
-        statusCallback!(RealtimeSubscribeStatus.subscribed, null);
-
-        leadingResponse.complete(
-          Response(jsonEncode([]), 200, request: Request('GET', Uri())),
-        );
-        await leadingSweep;
-        expect(metadataGetCount, 1);
-      },
-    );
-
-    test('A (re)connect forces a reconcile to backfill missed events', () async {
-      void Function(RealtimeSubscribeStatus, Object?)? statusCb;
-      when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
-        statusCb =
-            inv.positionalArguments.first
-                as void Function(RealtimeSubscribeStatus, Object?)?;
-        return mockRealtimeChannel;
-      });
-
-      final syncManager = buildManager();
-      syncManager.setUserId(const Uuid().v4());
-      syncManager.enableSync();
-
-      await waitForFunctionToPass(() async => expect(statusCb, isNotNull));
-
-      // Quiesce: wait until the connect-time reconciles stop firing so the delta
-      // we measure is attributable to the status callback, not a pending sync.
-      var before = 0;
-      await waitForFunctionToPass(() async {
-        final count = syncManager.nFullSyncs;
-        await Future<void>.delayed(const Duration(milliseconds: 30));
-        expect(syncManager.nFullSyncs, count);
-        before = count;
-      });
-
-      statusCb!(RealtimeSubscribeStatus.subscribed, null);
-
-      await waitForFunctionToPass(
-        () async => expect(syncManager.nFullSyncs, greaterThan(before)),
+        reason: 'late accepted offline writes must remain discoverable',
       );
       syncManager.dispose();
-    });
-
-    test('A dropped channel is resubscribed', () async {
-      var subscribeCount = 0;
-      void Function(RealtimeSubscribeStatus, Object?)? statusCb;
-      when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
-        subscribeCount++;
-        statusCb =
-            inv.positionalArguments.first
-                as void Function(RealtimeSubscribeStatus, Object?)?;
-        return mockRealtimeChannel;
-      });
-
-      final syncManager = buildManager();
-      syncManager.setUserId(const Uuid().v4());
-      syncManager.enableSync();
-
-      await waitForFunctionToPass(() async => expect(subscribeCount, 1));
-
-      // Simulate the socket dropping under us.
-      statusCb!(RealtimeSubscribeStatus.channelError, Exception('boom'));
-
-      // A fresh channel must be built and subscribed.
-      await waitForFunctionToPass(
-        () async => expect(subscribeCount, greaterThanOrEqualTo(2)),
-      );
-      syncManager.dispose();
-    });
-
-    test('resubscribe delays grow exponentially across consecutive drops', () {
-      final callbacks = <void Function(RealtimeSubscribeStatus, Object?)?>[];
-      var subscribeCount = 0;
-      final timers = FakeTimerFactory();
-      when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
-        subscribeCount++;
-        callbacks.add(
-          inv.positionalArguments.first
-              as void Function(RealtimeSubscribeStatus, Object?)?,
-        );
-        return mockRealtimeChannel;
-      });
-
-      final syncManager = SyncManager<TestDatabase>(
-        localDatabase: testDb,
-        supabaseClient: mockSupabaseClient,
-        syncInterval: const Duration(milliseconds: 50),
-        random: FixedRandom(0.5),
-        timerFactory: timers.call,
-      );
-      addTearDown(syncManager.dispose);
-      syncManager.registerSyncable<Item>(
-        backendTable: itemsTable,
-        fromJson: Item.fromJson,
-        companionConstructor: ItemsCompanion.new,
-      );
-      syncManager.setUserId(const Uuid().v4());
-      syncManager.enableSync();
-
-      expect(subscribeCount, 1);
-      callbacks[0]!(RealtimeSubscribeStatus.channelError, Exception('first'));
-      expect(timers.timers.single.duration, const Duration(milliseconds: 50));
-      timers.timers.single.fire();
-      expect(subscribeCount, 2);
-
-      callbacks[1]!(RealtimeSubscribeStatus.channelError, Exception('second'));
-      expect(timers.timers[1].duration, const Duration(milliseconds: 100));
-      timers.timers[1].fire();
-      expect(subscribeCount, 3);
-    });
-
-    test('a successful subscribe resets the next retry to the base delay', () {
-      final callbacks = <void Function(RealtimeSubscribeStatus, Object?)?>[];
-      var subscribeCount = 0;
-      final timers = FakeTimerFactory();
-      when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
-        subscribeCount++;
-        callbacks.add(
-          inv.positionalArguments.first
-              as void Function(RealtimeSubscribeStatus, Object?)?,
-        );
-        return mockRealtimeChannel;
-      });
-
-      final syncManager = SyncManager<TestDatabase>(
-        localDatabase: testDb,
-        supabaseClient: mockSupabaseClient,
-        syncInterval: const Duration(milliseconds: 50),
-        random: FixedRandom(0.5),
-        timerFactory: timers.call,
-      );
-      addTearDown(syncManager.dispose);
-      syncManager.registerSyncable<Item>(
-        backendTable: itemsTable,
-        fromJson: Item.fromJson,
-        companionConstructor: ItemsCompanion.new,
-      );
-      syncManager.setUserId(const Uuid().v4());
-      syncManager.enableSync();
-
-      expect(subscribeCount, 1);
-      callbacks[0]!(RealtimeSubscribeStatus.channelError, Exception('first'));
-      timers.timers[0].fire();
-      expect(subscribeCount, 2);
-      callbacks[1]!(RealtimeSubscribeStatus.channelError, Exception('second'));
-      timers.timers[1].fire();
-      expect(subscribeCount, 3);
-
-      callbacks[2]!(RealtimeSubscribeStatus.subscribed, null);
-      callbacks[2]!(RealtimeSubscribeStatus.channelError, Exception('third'));
-      expect(timers.timers[2].duration, const Duration(milliseconds: 50));
-      timers.timers[2].fire();
-      expect(subscribeCount, 4);
-    });
-
-    test('jitter uses both bounds and clamps only after jittering', () {
-      final callbacks = <void Function(RealtimeSubscribeStatus, Object?)?>[];
-      when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
-        callbacks.add(
-          inv.positionalArguments.first
-              as void Function(RealtimeSubscribeStatus, Object?)?,
-        );
-        return mockRealtimeChannel;
-      });
-
-      var timers = FakeTimerFactory();
-      SyncManager<TestDatabase> makeManager(double randomValue) {
-        final syncManager = SyncManager<TestDatabase>(
-          localDatabase: testDb,
-          supabaseClient: mockSupabaseClient,
-          syncInterval: const Duration(milliseconds: 5),
-          random: FixedRandom(randomValue),
-          timerFactory: timers.call,
-        );
-        addTearDown(syncManager.dispose);
-        syncManager.registerSyncable<Item>(
-          backendTable: itemsTable,
-          fromJson: Item.fromJson,
-          companionConstructor: ItemsCompanion.new,
-        );
-        syncManager.setUserId(const Uuid().v4());
-        syncManager.enableSync();
-        return syncManager;
-      }
-
-      void driveToCap() {
-        // 5 ms * 2^26 crosses the five-minute cap. Fire every fake retry
-        // leading up to that crossing without waiting on elapsed wall time.
-        for (var i = 1; i <= 25; i++) {
-          callbacks[i]!(
-            RealtimeSubscribeStatus.channelError,
-            Exception('drop $i'),
-          );
-          timers.timers[i].fire();
-        }
-        callbacks[26]!(RealtimeSubscribeStatus.channelError, Exception('cap'));
-      }
-
-      makeManager(0.0);
-      callbacks[0]!(RealtimeSubscribeStatus.channelError, Exception('low'));
-      expect(
-        timers.timers[0].duration.inMicroseconds,
-        inInclusiveRange(
-          const Duration(milliseconds: 3).inMicroseconds,
-          const Duration(milliseconds: 4).inMicroseconds,
-        ),
-      );
-      timers.timers[0].fire();
-      driveToCap();
-      expect(
-        timers.timers[26].duration,
-        greaterThan(const Duration(minutes: 4)),
-      );
-      expect(timers.timers[26].duration, lessThan(const Duration(minutes: 5)));
-
-      callbacks.clear();
-      timers = FakeTimerFactory();
-      makeManager(1.0);
-      callbacks[0]!(RealtimeSubscribeStatus.channelError, Exception('high'));
-      expect(
-        timers.timers[0].duration.inMicroseconds,
-        inInclusiveRange(
-          const Duration(milliseconds: 6).inMicroseconds,
-          const Duration(milliseconds: 7).inMicroseconds,
-        ),
-      );
-      timers.timers[0].fire();
-      driveToCap();
-      expect(timers.timers[26].duration, const Duration(minutes: 5));
-    });
-
-    test('a pending retry cannot be bypassed by a dependency change', () {
-      var subscribeCount = 0;
-      final callbacks = <void Function(RealtimeSubscribeStatus, Object?)?>[];
-      final timers = FakeTimerFactory();
-      when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
-        subscribeCount++;
-        callbacks.add(
-          inv.positionalArguments.first
-              as void Function(RealtimeSubscribeStatus, Object?)?,
-        );
-        return mockRealtimeChannel;
-      });
-
-      final syncManager = buildManager(
-        random: FixedRandom(0.5),
-        timerFactory: timers,
-      );
-      addTearDown(syncManager.dispose);
-      syncManager.setUserId(const Uuid().v4());
-      syncManager.enableSync();
-      expect(subscribeCount, 1);
-
-      callbacks[0]!(RealtimeSubscribeStatus.channelError, Exception('drop'));
-      syncManager.setLastTimeOtherDeviceWasActive(DateTime.now().toUtc());
-      expect(subscribeCount, 1);
-      expect(timers.timers.single.isActive, isTrue);
-
-      timers.timers.single.fire();
-      expect(subscribeCount, 2);
-    });
-
-    test('A drop is ignored once we no longer want a subscription', () async {
-      var subscribeCount = 0;
-      void Function(RealtimeSubscribeStatus, Object?)? statusCb;
-      when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
-        subscribeCount++;
-        statusCb =
-            inv.positionalArguments.first
-                as void Function(RealtimeSubscribeStatus, Object?)?;
-        return mockRealtimeChannel;
-      });
-
-      final syncManager = buildManager(
-        inactiveAfter: const Duration(seconds: 1),
-      );
-      syncManager.setUserId(const Uuid().v4());
-      syncManager.enableSync();
-      await waitForFunctionToPass(() async => expect(subscribeCount, 1));
-
-      // Other devices go inactive → the manager intentionally drops the channel.
-      syncManager.setLastTimeOtherDeviceWasActive(
-        DateTime.now().subtract(const Duration(seconds: 2)).toUtc(),
-      );
-      await waitForFunctionToPass(
-        () async => expect(syncManager.isSubscribedToBackend, isFalse),
-      );
-
-      final countAfterTeardown = subscribeCount;
-      // A late drop callback from the torn-down channel must not resubscribe.
-      statusCb!(RealtimeSubscribeStatus.closed, null);
-      await Future<void>.delayed(const Duration(milliseconds: 20));
-      expect(subscribeCount, countAfterTeardown);
-
-      syncManager.dispose();
-    });
-
-    test('intentional teardown resets the next retry backoff', () {
-      final callbacks = <void Function(RealtimeSubscribeStatus, Object?)?>[];
-      var subscribeCount = 0;
-      when(mockRealtimeChannel.subscribe(any)).thenAnswer((inv) {
-        subscribeCount++;
-        callbacks.add(
-          inv.positionalArguments.first
-              as void Function(RealtimeSubscribeStatus, Object?)?,
-        );
-        return mockRealtimeChannel;
-      });
-
-      final timers = FakeTimerFactory();
-      final syncManager = buildManager(
-        inactiveAfter: const Duration(seconds: 1),
-        random: FixedRandom(0.5),
-        timerFactory: timers,
-      );
-      addTearDown(syncManager.dispose);
-      syncManager.setUserId(const Uuid().v4());
-      syncManager.enableSync();
-      expect(subscribeCount, 1);
-
-      callbacks[0]!(RealtimeSubscribeStatus.channelError, Exception('drop'));
-      expect(timers.timers[0].duration, const Duration(milliseconds: 1));
-
-      syncManager.setLastTimeOtherDeviceWasActive(
-        DateTime.now().subtract(const Duration(seconds: 2)).toUtc(),
-      );
-      expect(syncManager.isSubscribedToBackend, isFalse);
-      expect(timers.timers[0].isActive, isFalse);
-
-      syncManager.setLastTimeOtherDeviceWasActive(DateTime.now().toUtc());
-      expect(subscribeCount, 2);
-      callbacks[1]!(RealtimeSubscribeStatus.channelError, Exception('new'));
-      expect(timers.timers[1].duration, const Duration(milliseconds: 1));
-      timers.timers[1].fire();
-      expect(subscribeCount, 3);
-    });
-  });
-
-  group('Sweep observability (MC-424 §E)', () {
-    late List<LogRecord> records;
-    late StreamSubscription<LogRecord> logSub;
-    late Level previousRootLevel;
-
-    setUp(() {
-      previousRootLevel = Logger.root.level;
-      Logger.root.level = Level.ALL;
-      records = [];
-      logSub = Logger.root.onRecord.listen(records.add);
-    });
-
-    tearDown(() async {
-      await logSub.cancel();
-      Logger.root.level = previousRootLevel;
-    });
-
-    SyncManager<TestDatabase> buildManager() {
-      final syncManager = SyncManager<TestDatabase>(
-        localDatabase: testDb,
-        supabaseClient: mockSupabaseClient,
-        syncInterval: const Duration(milliseconds: 1),
-        syncTimestampStorage: TimestampStorage(),
-      );
-      syncManager.registerSyncable<Item>(
-        backendTable: itemsTable,
-        fromJson: Item.fromJson,
-        companionConstructor: ItemsCompanion.new,
-      );
-      return syncManager;
-    }
-
-    test('every sweep emits a per-table outcome line, even with nothing '
-        'to push or pull', () async {
-      // The June-10 stranded-cache incident: six consecutive sweeps fetched
-      // nothing and logged nothing, leaving a multi-day outage with zero
-      // telemetry. An empty sweep must still say it ran and what it saw.
-      final syncManager = buildManager();
-      syncManager.setUserId(const Uuid().v4());
-      syncManager.enableSync();
-      // enableSync fires its own (un-awaited) sweep; let it finish so it
-      // can't bleed an outcome line into the assertion window.
-      await waitForFunctionToPass(() async {
-        expect(
-          records.any((r) => r.message.startsWith('Sweep $itemsTable:')),
-          isTrue,
-        );
-      });
-      records.clear();
-
-      await syncManager.syncTables();
-      syncManager.dispose();
-
-      final outcome = records.where(
-        (r) =>
-            r.level == Level.INFO && r.message.startsWith('Sweep $itemsTable:'),
-      );
-      expect(
-        outcome,
-        hasLength(1),
-        reason: 'exactly one outcome line per table per sweep',
-      );
-      expect(outcome.single.message, contains('pulled 0'));
-      expect(
-        outcome.single.message,
-        contains('watermark'),
-        reason:
-            'outcome must carry the watermark used for the '
-            'incremental filter so an empty sweep is diagnosable',
-      );
-    });
-
-    test('a failing table sweep logs a severe naming the table, then '
-        'rethrows', () async {
-      // Today a mid-sweep throw surfaces app-side as a bare "reconcile
-      // failed" with no table attribution (FLUTTER-1R).
-      final syncManager = buildManager();
-      syncManager.setUserId(const Uuid().v4());
-      syncManager.enableSync();
-      // Let the enable-triggered sweep finish against the healthy stub
-      // before poisoning the metadata fetch.
-      await waitForFunctionToPass(() async {
-        expect(
-          records.any((r) => r.message.startsWith('Sweep $itemsTable:')),
-          isTrue,
-        );
-      });
-      when(mockHttpClient.get(any, headers: anyNamed('headers'))).thenAnswer(
-        (_) async => Response(
-          jsonEncode({'message': 'permission denied', 'code': '42501'}),
-          403,
-          request: Request('GET', Uri()),
-          headers: {'content-type': 'application/json; charset=utf-8'},
-        ),
-      );
-      records.clear();
-
-      await expectLater(syncManager.syncTables(), throwsA(anything));
-      syncManager.dispose();
-
-      final severe = records.where(
-        (r) => r.level == Level.SEVERE && r.message.contains(itemsTable),
-      );
-      expect(severe, isNotEmpty, reason: 'failure must name the table');
-      expect(
-        severe.first.error,
-        isNotNull,
-        reason:
-            'the cause must travel with the record so the Sentry '
-            'bridge can attach it',
-      );
-    });
-
-    test('a row that stays dirty across sweeps raises one stuck-row severe '
-        'at the threshold, not one per sweep', () async {
-      // Persistent-transient push failure: the batch re-enqueues forever and
-      // dirty never clears, but (pre-§E) nothing ever reaches Sentry.
-      when(
-        mockHttpClient.post(
-          any,
-          headers: anyNamed('headers'),
-          body: anyNamed('body'),
-          encoding: anyNamed('encoding'),
-        ),
-      ).thenAnswer(
-        (_) async =>
-            Response('server error', 500, request: Request('POST', Uri())),
-      );
-
-      final syncManager = buildManager();
-      final userId = const Uuid().v4();
-      syncManager.setUserId(userId);
-      syncManager.enableSync();
-
-      final rowId = const Uuid().v4();
-      await testDb
-          .into(testDb.items)
-          .insert(
-            ItemsCompanion(
-              id: drift.Value(rowId),
-              userId: drift.Value(userId),
-              updatedAt: drift.Value(DateTime.now()),
-              deleted: const drift.Value(false),
-              name: const drift.Value('never pushes'),
-            ),
-          );
-
-      // Twice the threshold: the detector must fire exactly once, when the
-      // streak crosses the threshold — not on every later sweep.
-      for (var i = 0; i < 10; i++) {
-        await syncManager.syncTables();
-      }
-      syncManager.dispose();
-
-      final stuck = records.where(
-        (r) => r.level == Level.SEVERE && r.message.contains('Stuck row'),
-      );
-      expect(stuck, hasLength(1));
-      expect(stuck.single.message, contains(rowId));
-      expect(stuck.single.message, contains(itemsTable));
-    });
-
-    test('signed-out sweep states log at info, not warning', () async {
-      // "Syncing is disabled" is the normal signed-out state. At warning it
-      // becomes a Sentry capture on every signed-out launch (FLUTTER-1B/1C/1E).
-      final syncManager = buildManager();
-      records.clear();
-
-      await syncManager.syncTables(); // sync never enabled
-      syncManager.dispose();
-
-      expect(
-        records.where((r) => r.level >= Level.WARNING),
-        isEmpty,
-        reason: 'expected signed-out states must not be warnings',
-      );
-      expect(
-        records.map((r) => r.message),
-        contains(contains('syncing is disabled')),
-        reason: 'the state should still be visible as a breadcrumb',
-      );
     });
   });
 
