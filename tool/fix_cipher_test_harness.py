@@ -21,4 +21,13 @@ s = s.replace(
     1,
 )
 
+slow_post_anchor = """    when(\n      mockHttpClient.post(\n        any,\n        headers: anyNamed('headers'),\n        body: anyNamed('body'),\n      ),\n    ).thenAnswer((inv) async {\n      final body = inv.namedArguments[#body] as String;\n      final rows = (jsonDecode(body) as List).cast<Map<String, dynamic>>();\n      if (rows.isNotEmpty && rows.first.containsKey(nameKey)) {\n        itemsPushStarted = true;\n        await Future<void>.delayed(const Duration(milliseconds: 250));\n      } else {\n        pushedBatches.add(rows);\n      }\n      return Response(\n        body,\n        200,\n        request: Request('POST', Uri()),\n        headers: {'content-type': 'application/json; charset=utf-8'},\n      );\n    });\n"""
+if slow_post_anchor not in s:
+    raise SystemExit('slow POST harness anchor not found')
+s = s.replace(
+    slow_post_anchor,
+    """    when(mockHttpClient.send(any)).thenAnswer((invocation) async {\n      final request = invocation.positionalArguments[0] as BaseRequest;\n      if (request.method == 'POST') {\n        final body = (request as Request).body;\n        final rows = (jsonDecode(body) as List).cast<Map<String, dynamic>>();\n        if (rows.isNotEmpty && rows.first.containsKey(nameKey)) {\n          itemsPushStarted = true;\n          await Future<void>.delayed(const Duration(milliseconds: 250));\n        } else {\n          pushedBatches.add(rows);\n        }\n        return StreamedResponse(\n          Stream<List<int>>.value(utf8.encode(body)),\n          200,\n          request: request,\n          headers: {'content-type': 'application/json; charset=utf-8'},\n        );\n      }\n\n      return StreamedResponse(\n        Stream<List<int>>.value(utf8.encode(jsonEncode(backendRows))),\n        200,\n        request: request,\n        headers: {'content-type': 'application/json; charset=utf-8'},\n      );\n    });\n""",
+    1,
+)
+
 p.write_text(s)
