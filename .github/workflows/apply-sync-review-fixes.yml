@@ -7,6 +7,7 @@ on:
     paths:
       - tool/apply_sync_review_fixes.py
       - tool/fix_sync_patch_analyzer.py
+      - tool/fix_cipher_test_harness.py
       - .github/workflows/apply-sync-review-fixes.yml
 
 permissions:
@@ -26,8 +27,9 @@ jobs:
         run: |
           python3 tool/apply_sync_review_fixes.py
           python3 tool/fix_sync_patch_analyzer.py
+          python3 tool/fix_cipher_test_harness.py
       - name: Format
-        run: dart format lib/src/sync_manager.dart lib/src/syncable_database.dart test/sync_manager_test.dart
+        run: dart format lib/src/sync_manager.dart lib/src/syncable_database.dart test/sync_manager_test.dart test/sync_field_cipher_seam_test.dart
       - name: Analyze
         run: dart analyze
       - name: Test unit suite
@@ -38,6 +40,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           rm tool/apply_sync_review_fixes.py
           rm tool/fix_sync_patch_analyzer.py
+          rm tool/fix_cipher_test_harness.py
           rm .github/workflows/apply-sync-review-fixes.yml
           git add -A
           git commit -m "fix(sync): correct worker lifecycle and reconciliation"
