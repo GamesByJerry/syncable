@@ -1,0 +1,40 @@
+name: Apply sync review fixes
+
+on:
+  push:
+    branches:
+      - fix/sync-correctness-and-work-reduction
+    paths:
+      - tool/apply_sync_review_fixes.py
+      - .github/workflows/apply-sync-review-fixes.yml
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/sync-correctness-and-work-reduction
+      - uses: dart-lang/setup-dart@v1
+      - name: Install dependencies
+        run: dart pub get
+      - name: Apply patch
+        run: python3 tool/apply_sync_review_fixes.py
+      - name: Format
+        run: dart format lib/src/sync_manager.dart lib/src/syncable_database.dart test/sync_manager_test.dart
+      - name: Analyze
+        run: dart analyze
+      - name: Test
+        run: dart test
+      - name: Commit implementation
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm tool/apply_sync_review_fixes.py
+          rm .github/workflows/apply-sync-review-fixes.yml
+          git add -A
+          git commit -m "fix(sync): correct worker lifecycle and reconciliation"
+          git push origin HEAD:fix/sync-correctness-and-work-reduction
