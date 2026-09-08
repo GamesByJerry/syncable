@@ -17,7 +17,7 @@ if get_anchor not in s:
     raise SystemExit('GET harness anchor not found')
 s = s.replace(
     get_anchor,
-    """    // PostgREST executes SELECTs through BaseClient.send(), not get().\n    // Serve [backendRows] to both metadata discovery and full-row batch pulls.\n    when(mockHttpClient.send(any)).thenAnswer((invocation) async {\n      final request = invocation.positionalArguments[0] as BaseRequest;\n      final bytes = utf8.encode(jsonEncode(backendRows));\n      return StreamedResponse(\n        Stream<List<int>>.value(bytes),\n        200,\n        request: request,\n        headers: {'content-type': 'application/json; charset=utf-8'},\n      );\n    });\n""",
+    """    // Current PostgREST executes requests through BaseClient.send(). Preserve\n    // the suite's original semantics: GETs read [backendRows], POSTs record the\n    // exact upsert payload and echo it back as a successful response.\n    when(mockHttpClient.send(any)).thenAnswer((invocation) async {\n      final request = invocation.positionalArguments[0] as BaseRequest;\n      if (request.method == 'POST') {\n        final body = (request as Request).body;\n        pushedBatches.add(\n          (jsonDecode(body) as List).cast<Map<String, dynamic>>(),\n        );\n        return StreamedResponse(\n          Stream<List<int>>.value(utf8.encode(body)),\n          200,\n          request: request,\n          headers: {'content-type': 'application/json; charset=utf-8'},\n        );\n      }\n\n      final bytes = utf8.encode(jsonEncode(backendRows));\n      return StreamedResponse(\n        Stream<List<int>>.value(bytes),\n        200,\n        request: request,\n        headers: {'content-type': 'application/json; charset=utf-8'},\n      );\n    });\n""",
     1,
 )
 
