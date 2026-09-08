@@ -25,7 +25,7 @@ s = s.replace(
 # able to strand older dirty rows. Replace it with per-row version state:
 # successful versions live in _sentItems and currently-attempted versions live
 # in _outgoingInFlight.
-field_anchor = "  final Map<Type, Map<String, DateTime>> _outgoingRetryAttempts = {};\n"
+field_anchor = "  final Map<Type, int> _outgoingRetryAttempts = {};\n"
 if field_anchor not in s:
     raise SystemExit('outgoing retry field anchor not found')
 s = s.replace(
@@ -58,10 +58,8 @@ if predicate_old not in s:
     raise SystemExit('outgoing discovery predicate anchor not found')
 s = s.replace(predicate_old, predicate_new, 1)
 
-# Hold the selected versions in the per-row in-flight set across encoding and
-# the network verdict. A finally block guarantees exceptions do not strand an
-# in-flight marker. Successful versions remain suppressed by _sentItems; failed
-# versions are requeued and become eligible again after this marker is released.
+# Hold selected versions in the per-row in-flight set across encoding and the
+# network verdict. A finally block guarantees exceptions do not strand a marker.
 process_start = s.find("    assert(!outgoing.any((row) => row.userId?.isEmpty ?? true));")
 process_end_marker = "\n  }\n\n  Future<void> _upsertPayloads("
 process_end = s.find(process_end_marker, process_start)
