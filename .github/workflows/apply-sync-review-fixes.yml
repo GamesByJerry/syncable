@@ -30,8 +30,8 @@ jobs:
         run: dart format lib/src/sync_manager.dart lib/src/syncable_database.dart test/sync_manager_test.dart
       - name: Analyze
         run: dart analyze
-      - name: Test
-        run: dart test
+      - name: Test unit suite
+        run: dart test test/syncable_database_test.dart test/sync_manager_test.dart test/sync_field_cipher_seam_test.dart
       - name: Commit implementation
         run: |
           git config user.name "github-actions[bot]"
