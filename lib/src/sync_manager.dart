@@ -13,6 +13,12 @@ import 'package:syncable/src/syncable.dart';
 import 'package:syncable/src/syncable_database.dart';
 import 'package:syncable/src/syncable_table.dart';
 
+class _SweepCompletion {
+  final Completer<void> completer = Completer<void>();
+  Object? error;
+  StackTrace? stack;
+}
+
 /// The [SyncManager] is the main class for syncing data between a local Drift
 /// database and a Supabase backend.
 ///
@@ -231,7 +237,7 @@ class SyncManager<T extends SyncableDatabase> {
   bool _pendingSweep = false;
   bool _pendingFullResync = false;
   String _pendingSweepReason = 'coalesced request';
-  Completer<void>? _sweepCompletion;
+  _SweepCompletion? _sweepCompletion;
 
   /// Set while the sync loop is parked in [_idle]. Completed by [_wake] to drain
   /// immediately instead of waiting for the [_syncInterval] backstop timer.
@@ -241,6 +247,7 @@ class SyncManager<T extends SyncableDatabase> {
   List<Type> get syncables => _syncables;
 
   final Map<Type, TableInfo<SyncableTable, Syncable>> _localTables = {};
+  final Map<Type, SyncableTable> _syncableTableColumns = {};
   final Map<Type, String> _backendTables = {};
   final Map<Type, bool> _liveUpdates = {};
 
@@ -424,6 +431,7 @@ class SyncManager<T extends SyncableDatabase> {
 
     _syncables.add(S);
     _localTables[S] = table;
+    _syncableTableColumns[S] = table as SyncableTable;
     _backendTables[S] = backendTable;
     _liveUpdates[S] = liveUpdates;
     _fromJsons[S] = fromJson;
@@ -887,8 +895,7 @@ class SyncManager<T extends SyncableDatabase> {
       _outgoingQuarantined[syncable]!.clear();
 
       final table = _localTables[syncable]!;
-      final dirtyColumn =
-          table.columnsByName['dirty']! as GeneratedColumn<bool>;
+      final dirtyColumn = _syncableTableColumns[syncable]!.dirty;
       final dirtyRows = await (_localDb.select(
         table,
       )..where((_) => dirtyColumn.equals(true))).get();
@@ -1362,12 +1369,17 @@ class SyncManager<T extends SyncableDatabase> {
       if (fullResync || _pendingSweepReason == 'coalesced request') {
         _pendingSweepReason = reason;
       }
-      await _sweepCompletion?.future;
+      final completion = _sweepCompletion;
+      await completion?.completer.future;
+      final error = completion?.error;
+      if (error != null) {
+        Error.throwWithStackTrace(error, completion!.stack!);
+      }
       return;
     }
 
     _sweepRunning = true;
-    final completion = _sweepCompletion = Completer<void>();
+    final completion = _sweepCompletion = _SweepCompletion();
     Object? firstError;
     StackTrace? firstStack;
 
@@ -1392,9 +1404,11 @@ class SyncManager<T extends SyncableDatabase> {
         Error.throwWithStackTrace(firstError, firstStack!);
       }
     } finally {
+      completion.error = firstError;
+      completion.stack = firstStack;
       _sweepRunning = false;
       _sweepCompletion = null;
-      if (!completion.isCompleted) completion.complete();
+      if (!completion.completer.isCompleted) completion.completer.complete();
     }
   }
 
@@ -1450,8 +1464,7 @@ class SyncManager<T extends SyncableDatabase> {
     // Push discovery needs complete models, but only dirty ones. Pull conflict
     // comparison only needs id + updated_at, so use a narrow projection rather
     // than materializing every content column in accumulated history.
-    final dirtyColumn =
-        localTable.columnsByName['dirty']! as GeneratedColumn<bool>;
+    final dirtyColumn = _syncableTableColumns[syncable]!.dirty;
     final dirtyItems = await (_localDb.select(
       localTable,
     )..where((_) => dirtyColumn.equals(true))).get();
