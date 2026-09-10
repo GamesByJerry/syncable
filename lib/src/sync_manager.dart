@@ -13,6 +13,12 @@ import 'package:syncable/src/syncable.dart';
 import 'package:syncable/src/syncable_database.dart';
 import 'package:syncable/src/syncable_table.dart';
 
+class _SweepCompletion {
+  final Completer<void> completer = Completer<void>();
+  Object? error;
+  StackTrace? stack;
+}
+
 /// The [SyncManager] is the main class for syncing data between a local Drift
 /// database and a Supabase backend.
 ///
@@ -93,7 +99,6 @@ class SyncManager<T extends SyncableDatabase> {
        _maxRows = maxRows,
        _syncTimestampStorage = syncTimestampStorage,
        _devicesConsideredInactiveAfter = otherDevicesConsideredInactiveAfter,
-       _reconcileOverlap = reconcileOverlap,
        _fieldCipher = fieldCipher,
        _onEncryptionAlert = onEncryptionAlert,
        _random = random ?? Random(),
@@ -101,6 +106,10 @@ class SyncManager<T extends SyncableDatabase> {
        assert(
          syncInterval.inMilliseconds > 0,
          'Sync interval must be positive',
+       ),
+       assert(
+         !reconcileOverlap.isNegative,
+         'Reconcile overlap cannot be negative',
        ) {
     // MC-442: watch the auth context so the engine reacts the instant a real
     // session lands — draining pushes the session gate withheld and clearing
@@ -123,7 +132,6 @@ class SyncManager<T extends SyncableDatabase> {
   final Duration _syncInterval;
   final int _maxRows;
   final Duration _devicesConsideredInactiveAfter;
-  final Duration _reconcileOverlap;
   final SyncFieldCipher? _fieldCipher;
   final void Function(SyncEncryptionAlert alert)? _onEncryptionAlert;
   final Random _random;
@@ -215,6 +223,22 @@ class SyncManager<T extends SyncableDatabase> {
   bool _disposed = false;
   bool _loopRunning = false;
 
+  /// A retry timer parks a table after a transient push failure. Queue occupancy
+  /// alone must never mean "retry immediately" or a fast 429/5xx/network error
+  /// turns the worker into a hot loop.
+  final Map<Type, Timer> _outgoingRetryTimers = {};
+  final Map<Type, int> _outgoingRetryAttempts = {};
+  final Map<Type, Set<Syncable>> _outgoingInFlight = {};
+  static const Duration _maxOutgoingRetryDelay = Duration(minutes: 5);
+
+  /// Coalesces overlapping reconcile requests into the one lifetime-owned
+  /// sweep. A full-resync request is sticky until the active sweep can service
+  /// it, so a weaker incremental request can never swallow it.
+  bool _pendingSweep = false;
+  bool _pendingFullResync = false;
+  String _pendingSweepReason = 'coalesced request';
+  _SweepCompletion? _sweepCompletion;
+
   /// Set while the sync loop is parked in [_idle]. Completed by [_wake] to drain
   /// immediately instead of waiting for the [_syncInterval] backstop timer.
   Completer<void>? _wakeSignal;
@@ -223,6 +247,7 @@ class SyncManager<T extends SyncableDatabase> {
   List<Type> get syncables => _syncables;
 
   final Map<Type, TableInfo<SyncableTable, Syncable>> _localTables = {};
+  final Map<Type, SyncableTable> _syncableTableColumns = {};
   final Map<Type, String> _backendTables = {};
   final Map<Type, bool> _liveUpdates = {};
 
@@ -338,6 +363,11 @@ class SyncManager<T extends SyncableDatabase> {
     _resubscribeTimer?.cancel();
     _resubscribeTimer = null;
     _resubscribeAttempts = 0;
+    for (final timer in _outgoingRetryTimers.values) {
+      timer.cancel();
+    }
+    _outgoingRetryTimers.clear();
+    _outgoingRetryAttempts.clear();
     for (final subscription in _localSubscriptions.values) {
       subscription.cancel();
     }
@@ -401,6 +431,7 @@ class SyncManager<T extends SyncableDatabase> {
 
     _syncables.add(S);
     _localTables[S] = table;
+    _syncableTableColumns[S] = table as SyncableTable;
     _backendTables[S] = backendTable;
     _liveUpdates[S] = liveUpdates;
     _fromJsons[S] = fromJson;
@@ -408,6 +439,7 @@ class SyncManager<T extends SyncableDatabase> {
     if (encryption != null) _encryption[S] = encryption;
     _inQueues[S] = {};
     _outQueues[S] = {};
+    _outgoingInFlight[S] = {};
     _sentItems[S] = {};
     _receivedItems[S] = {};
     _outgoingQuarantined[S] = {};
@@ -489,38 +521,43 @@ class SyncManager<T extends SyncableDatabase> {
   }
 
   Future<void> _startLoop() async {
+    // enable/disable is a state transition, not worker ownership. The manager
+    // owns exactly one worker for its lifetime; re-enabling only wakes it.
+    if (_loopRunning || _disposed) return;
     _loopRunning = true;
     _logger.info('Sync loop started');
 
-    while (!_disposed) {
-      try {
-        for (final syncable in _syncables) {
-          if (_disposed) break;
-          await _processOutgoing(syncable);
+    try {
+      while (!_disposed) {
+        // Incoming writes go first and outgoing work is bounded to one batch per
+        // table per pass. A slow upload can therefore delay at most one bounded
+        // batch before already-decoded realtime changes get another chance to
+        // land locally.
+        try {
+          for (final syncable in _syncables) {
+            if (_disposed) break;
+            await _processIncoming(syncable);
+          }
+        } catch (e, st) {
+          _logger.severe('Error processing incoming: $e\n$st');
         }
-      } catch (e, s) {
-        // coverage:ignore-start
-        _logger.severe('Error processing outgoing: $e\n$s');
-        // coverage:ignore-end
-      }
 
-      try {
-        for (final syncable in _syncables) {
-          if (_disposed) break;
-          await _processIncoming(syncable);
+        try {
+          for (final syncable in _syncables) {
+            if (_disposed) break;
+            await _processOutgoing(syncable);
+          }
+        } catch (e, st) {
+          _logger.severe('Error processing outgoing: $e\n$st');
         }
-      } catch (e, s) {
-        // coverage:ignore-start
-        _logger.severe('Error processing incoming: $e\n$s');
-        // coverage:ignore-end
-      }
 
-      if (_disposed) break;
-      await _idle();
+        if (_disposed) break;
+        await _idle();
+      }
+    } finally {
+      _loopRunning = false;
+      _logger.info('Sync loop stopped');
     }
-
-    _loopRunning = false;
-    _logger.info('Sync loop stopped');
   }
 
   /// Wakes the sync loop if it is currently parked in [_idle]. A no-op when the
@@ -605,22 +642,32 @@ class SyncManager<T extends SyncableDatabase> {
   /// [_syncInterval] backstop timer, whichever fires first.
   Future<void> _idle() async {
     if (_disposed) return;
-    // A backed-up out-queue only counts as actionable work when we can actually
-    // push it — i.e. there is a live session. Without one the engine withholds
-    // the push (MC-442), so don't let the full queue keep the loop spinning;
-    // park and let the auth-state listener wake us the instant a session lands
-    // (the backstop timer re-checks meanwhile).
-    if ((isSyncingToBackend && _hasLiveSession) || isSyncingFromBackend) return;
+
+    final actionableOutgoing =
+        _syncingEnabled &&
+        _hasLiveSession &&
+        _outQueues.entries.any(
+          (entry) =>
+              entry.value.isNotEmpty &&
+              !(_outgoingRetryTimers[entry.key]?.isActive ?? false),
+        );
+    if (actionableOutgoing || isSyncingFromBackend) return;
 
     final signal = _wakeSignal = Completer<void>();
-    final backstop = Timer(_syncInterval, () {
-      if (!signal.isCompleted) signal.complete();
-    });
+
+    // When deliberately disabled (or before a user id exists), park fully.
+    // enableSync/setUserId calls _onDependenciesChanged, which wakes the worker.
+    Timer? backstop;
+    if (_syncingEnabled) {
+      backstop = Timer(_syncInterval, () {
+        if (!signal.isCompleted) signal.complete();
+      });
+    }
 
     try {
       await signal.future;
     } finally {
-      backstop.cancel();
+      backstop?.cancel();
       if (identical(_wakeSignal, signal)) _wakeSignal = null;
     }
   }
@@ -848,8 +895,7 @@ class SyncManager<T extends SyncableDatabase> {
       _outgoingQuarantined[syncable]!.clear();
 
       final table = _localTables[syncable]!;
-      final dirtyColumn =
-          table.columnsByName['dirty']! as GeneratedColumn<bool>;
+      final dirtyColumn = _syncableTableColumns[syncable]!.dirty;
       final dirtyRows = await (_localDb.select(
         table,
       )..where((_) => dirtyColumn.equals(true))).get();
@@ -1041,11 +1087,11 @@ class SyncManager<T extends SyncableDatabase> {
     }
 
     for (final syncable in _syncables) {
-      _localSubscriptions[syncable] = _localDb.subscribe(
+      _localSubscriptions[syncable] = _localDb.subscribeToDirty(
         table: _localTables[syncable]!,
-        // GAM-389: RLS-trusting — watch ALL local rows, not just this user's,
-        // so a co-member-owned row still pushes when locally edited.
-        filter: (SyncableTable row) => const Constant<bool>(true),
+        // GAM-389 still applies: ownership is deliberately not part of this SQL
+        // predicate. We only narrow on persistent dirty state, so co-member rows
+        // edited locally still push without rematerializing clean history.
         onChange: (rows) {
           if (_syncingEnabled) {
             _pushLocalChangesToOutQueue(syncable, rows.cast());
@@ -1062,9 +1108,13 @@ class SyncManager<T extends SyncableDatabase> {
     final outQueue = _outQueues[syncable]!;
     final receivedItems = _receivedItems[syncable]!;
 
-    bool updateHasNotBeenSentYet(Syncable row) =>
-        row.updatedAt.isAfter(outQueue[row.id]?.updatedAt ?? DateTime(0)) &&
-        row.updatedAt.isAfter(_lastPushedTimestamp(syncable) ?? DateTime(0));
+    bool updateHasNotBeenSentYet(Syncable row) {
+      if (_sentItems[syncable]!.contains(row) ||
+          _outgoingInFlight[syncable]!.contains(row)) {
+        return false;
+      }
+      return row.updatedAt.isAfter(outQueue[row.id]?.updatedAt ?? DateTime(0));
+    }
 
     var enqueued = 0;
     for (final row
@@ -1313,11 +1363,52 @@ class SyncManager<T extends SyncableDatabase> {
   }
 
   Future<void> _syncTables(String reason, {bool fullResync = false}) async {
+    if (_sweepRunning) {
+      _pendingSweep = true;
+      _pendingFullResync = _pendingFullResync || fullResync;
+      if (fullResync || _pendingSweepReason == 'coalesced request') {
+        _pendingSweepReason = reason;
+      }
+      final completion = _sweepCompletion;
+      await completion?.completer.future;
+      final error = completion?.error;
+      if (error != null) {
+        Error.throwWithStackTrace(error, completion!.stack!);
+      }
+      return;
+    }
+
     _sweepRunning = true;
+    final completion = _sweepCompletion = _SweepCompletion();
+    Object? firstError;
+    StackTrace? firstStack;
+
     try {
-      await _performSyncTables(reason, fullResync: fullResync);
+      var nextReason = reason;
+      var nextFullResync = fullResync;
+      do {
+        _pendingSweep = false;
+        _pendingFullResync = false;
+        _pendingSweepReason = 'coalesced request';
+        try {
+          await _performSyncTables(nextReason, fullResync: nextFullResync);
+        } catch (e, st) {
+          firstError ??= e;
+          firstStack ??= st;
+        }
+        nextReason = _pendingSweepReason;
+        nextFullResync = _pendingFullResync;
+      } while (_pendingSweep && !_disposed);
+
+      if (firstError != null) {
+        Error.throwWithStackTrace(firstError, firstStack!);
+      }
     } finally {
+      completion.error = firstError;
+      completion.stack = firstStack;
       _sweepRunning = false;
+      _sweepCompletion = null;
+      if (!completion.completer.isCompleted) completion.completer.complete();
     }
   }
 
@@ -1325,9 +1416,6 @@ class SyncManager<T extends SyncableDatabase> {
     String reason, {
     required bool fullResync,
   }) async {
-    // Expected idle states (signed out / pre-login), not faults: INFO so they
-    // stay visible as breadcrumbs without becoming a Sentry capture on every
-    // signed-out launch (MC-424 §E).
     if (!__syncingEnabled) {
       _logger.info('Tables not getting synced because syncing is disabled');
       return;
@@ -1338,116 +1426,112 @@ class SyncManager<T extends SyncableDatabase> {
       return;
     }
 
-    // The identity matters for forensics: watermarks are stored per-user, so a
-    // sweep running under an unexpected user ID explains "fetched nothing".
     _logger.info('Syncing all tables. Reason: $reason (user: $_userId)');
 
+    Object? firstError;
+    StackTrace? firstStack;
     for (final syncable in _syncables) {
       try {
         await _syncTable(syncable, fullResync: fullResync);
-      } catch (e, s) {
-        // Name the table before propagating: app-side this otherwise surfaces
-        // as a bare "reconcile failed" with no attribution (MC-424 §E).
+      } catch (e, st) {
+        firstError ??= e;
+        firstStack ??= st;
         _logger.severe(
           'Sweep failed at table ${_backendTables[syncable]}',
           e,
-          s,
+          st,
         );
-        rethrow;
+        // Tables are independent unless explicitly modeled otherwise. One bad
+        // table must not starve every table registered after it.
       }
     }
 
     _nFullSyncs++;
+    if (firstError != null) {
+      Error.throwWithStackTrace(firstError, firstStack!);
+    }
   }
 
   Future<void> _syncTable(Type syncable, {bool fullResync = false}) async {
-    final table = _backendTables[syncable];
+    final backendTable = _backendTables[syncable];
+    final localTable = _localTables[syncable]!;
 
     if (!_syncingEnabled) {
-      _logger.info('Sweep $table: skipped (syncing disabled)');
+      _logger.info('Sweep $backendTable: skipped (syncing disabled)');
       return;
     }
 
-    final localItems = await _localDb.select(_localTables[syncable]!).get();
+    // Push discovery needs complete models, but only dirty ones. Pull conflict
+    // comparison only needs id + updated_at, so use a narrow projection rather
+    // than materializing every content column in accumulated history.
+    final dirtyColumn = _syncableTableColumns[syncable]!.dirty;
+    final dirtyItems = await (_localDb.select(
+      localTable,
+    )..where((_) => dirtyColumn.equals(true))).get();
 
-    // Check after async gap
+    final idColumn =
+        localTable.columnsByName[idKey]! as GeneratedColumn<String>;
+    final updatedAtColumn =
+        localTable.columnsByName[updatedAtKey]! as GeneratedColumn<DateTime>;
+    final metadataRows = await (_localDb.selectOnly(
+      localTable,
+    )..addColumns([idColumn, updatedAtColumn])).get();
+    final localItemsUpdatedAt = <String, DateTime>{
+      for (final row in metadataRows)
+        row.read(idColumn)!: row.read(updatedAtColumn)!,
+    };
+
     if (!_syncingEnabled) {
-      _logger.info('Sweep $table: skipped (syncing disabled mid-sweep)');
+      _logger.info('Sweep $backendTable: skipped (syncing disabled mid-sweep)');
       return;
     }
 
-    assert(_userId.isNotEmpty);
-    // GAM-389: push ALL local rows, not just this user's. The updatedAt /
-    // receivedItems dedup below still guards against echoing pulled rows.
-    final queued = _pushLocalChangesToOutQueue(syncable, localItems);
+    final queued = _pushLocalChangesToOutQueue(syncable, dirtyItems);
+    _trackStuckRows(syncable, dirtyItems);
 
-    _trackStuckRows(syncable, localItems);
-
-    // A forced full resync must always pull: the caller is widening visibility
-    // (e.g. a just-joined circle), so the "no other device was active" shortcut
-    // — which is only about avoiding redundant pulls of unchanged data — must
-    // not suppress it.
     if (!fullResync && _skipSyncFromBackend(syncable)) {
       _logger.info(
-        'Sweep $table: queued $queued for push, pull skipped '
+        'Sweep $backendTable: queued $queued for push, pull skipped '
         '(no other device active since last sync)',
       );
       return;
     }
 
-    final localItemsUpdatedAt = {for (final i in localItems) i.id: i.updatedAt};
-
-    assert(_userId.isNotEmpty);
-    // The watermark the metadata fetch will filter on — logged with the
-    // outcome so a sweep that "fetched nothing" is diagnosable (was it a full
-    // sweep, or incremental against a watermark that's ahead of the data?).
-    final watermark = fullResync
-        ? null
-        : _lastPulledTimestamp(syncable)?.toUtc();
-    // Capture the watermark BEFORE fetching: any row written while this pull is
-    // in flight has updatedAt >= pullStartedAt, so the next reconcile's
-    // `> pullStartedAt - overlap` filter still catches it.
     final pullStartedAt = DateTime.now().toUtc();
-    final backendItems = await _fetchBackendItemMetadata(
-      syncable,
-      fullResync: fullResync,
-    );
-
+    final backendItems = await _fetchBackendItemMetadata(syncable);
     final itemsToPull = _getItemsToPullFromBackend(
       backendItems,
       localItemsUpdatedAt,
-    );
+    ).toList();
 
-    // Use batches because all the UUIDs make the URI become too long otherwise.
     for (final batch in itemsToPull.slices(100)) {
       if (!_syncingEnabled) {
-        _logger.info('Sweep $table: aborted (syncing disabled mid-pull)');
+        _logger.info(
+          'Sweep $backendTable: aborted (syncing disabled mid-pull)',
+        );
         return;
       }
       final pulledBatch = await _supabaseClient
           .from(_backendTables[syncable]!)
           .select()
-          // GAM-389: no user_id filter — pull whatever RLS permits.
           .inFilter(idKey, batch);
 
-      // Decode the wire rows (decrypting registered content) concurrently —
-      // ids within a batch are unique, so completion order cannot reorder
-      // versions of a row. _enqueueIncoming contains per-row failures and
-      // wakes the loop so an off-loop reconcile's finds get written promptly.
       await Future.wait(
         pulledBatch.map((wireRow) => _enqueueIncoming(syncable, wireRow)),
       );
+
+      // Acknowledge progress only after this page is durably applied locally.
+      // This closes the crash window where the old code persisted its cursor
+      // while decoded rows were still waiting in the worker queue.
+      await _processIncoming(syncable);
     }
 
     await _updateLastPulledTimeStamp(syncable, pullStartedAt);
 
-    // One outcome line per table per sweep — an empty sweep must still say it
-    // ran and what it saw (MC-424 §E: six silent empty sweeps hid a multi-day
-    // stranded-cache outage).
     _logger.info(
-      'Sweep $table: queued $queued for push, pulled ${itemsToPull.length} '
-      'of ${backendItems.length} backend candidates '
-      '(watermark: ${watermark?.toIso8601String() ?? 'none — full sweep'})',
+      'Sweep $backendTable: queued $queued for push, pulled '
+      '${itemsToPull.length} of ${backendItems.length} backend candidates '
+      '(full metadata reconciliation)',
     );
   }
 
@@ -1471,43 +1555,25 @@ class SyncManager<T extends SyncableDatabase> {
   /// syncable in the backend. These can be used to determine which items need
   /// to be synced from the backend.
   Future<List<Map<String, dynamic>>> _fetchBackendItemMetadata(
-    Type syncable, {
-    bool fullResync = false,
-  }) async {
+    Type syncable,
+  ) async {
     final List<Map<String, dynamic>> backendItems = [];
 
-    // MC-413 item 4: incremental sweep. Once we have a watermark from a previous
-    // pull, only ask the backend for rows changed since then (minus the overlap
-    // window), turning an O(all rows) sweep into O(rows changed since last
-    // pull). A null watermark — first pull, or no timestamp storage — falls back
-    // to a full sweep so the initial reconcile never misses anything.
-    // Force UTC: the watermark comes from a pluggable SyncTimestampStorage that
-    // may hand back a local DateTime, and toIso8601String() on a local time
-    // omits the 'Z' the backend needs — a silent timezone mismatch in the
-    // server-side `updated_at >` filter.
-    // A forced full resync deliberately discards the watermark so the sweep is
-    // unbounded — see [syncTables]'s `fullResync`. Rows that became newly
-    // readable but predate the watermark are only caught by an unbounded sweep.
-    final lastPulled = fullResync
-        ? null
-        : _lastPulledTimestamp(syncable)?.toUtc();
-    final changedSince = lastPulled?.subtract(_reconcileOverlap);
-
+    // updated_at is a conflict timestamp, not a server change cursor. An
+    // accepted offline edit can arrive much later while retaining an old
+    // updated_at, so filtering discovery by the reader's previous pull time can
+    // permanently hide a real change. Until the backend exposes a genuine
+    // monotonic change cursor, reconciliation intentionally reads all visible
+    // id/timestamp metadata and lets the cheap metadata comparison decide what
+    // content to fetch.
     int offset = 0;
     bool hasMore = true;
 
     while (hasMore && _syncingEnabled) {
-      var query = _supabaseClient
+      final batch = await _supabaseClient
           .from(_backendTables[syncable]!)
-          .select('$idKey,$updatedAtKey');
-      // GAM-389: no user_id filter — metadata for all RLS-visible rows.
-      if (changedSince != null) {
-        query = query.gt(updatedAtKey, changedSince.toIso8601String());
-      }
-
-      final batch = await query
+          .select('$idKey,$updatedAtKey')
           .range(offset, offset + _maxRows - 1)
-          // Use consistent ordering to prevent duplicates
           .order(idKey, ascending: true);
 
       backendItems.addAll(batch);
@@ -1856,46 +1922,70 @@ class SyncManager<T extends SyncableDatabase> {
   bool _isSessionlessRlsRejection(PostgrestException e) =>
       e.code == _rlsViolationCode && !_hasLiveSession;
 
+  bool _outgoingRetryParked(Type syncable) =>
+      _outgoingRetryTimers[syncable]?.isActive ?? false;
+
+  void _clearOutgoingRetry(Type syncable) {
+    _outgoingRetryTimers.remove(syncable)?.cancel();
+    _outgoingRetryAttempts.remove(syncable);
+  }
+
+  void _scheduleOutgoingRetry(Type syncable) {
+    if (_disposed || _outgoingRetryParked(syncable)) return;
+    final attempt = (_outgoingRetryAttempts[syncable] ?? 0) + 1;
+    _outgoingRetryAttempts[syncable] = attempt;
+
+    var delay = _syncInterval;
+    for (var i = 1; i < attempt && delay < _maxOutgoingRetryDelay; i++) {
+      delay *= 2;
+    }
+    final jittered = delay * (0.75 + _random.nextDouble() * 0.5);
+    delay = jittered > _maxOutgoingRetryDelay
+        ? _maxOutgoingRetryDelay
+        : jittered;
+
+    _outgoingRetryTimers[syncable] = _timerFactory(delay, () {
+      _outgoingRetryTimers.remove(syncable);
+      if (!_disposed) _wake();
+    });
+  }
+
   Future<void> _processOutgoing(Type syncable) async {
-    // MC-442: never push without a live Supabase session. A session-less push
-    // goes out as `anon`; circle-scoped RLS rejects valid rows with 42501 and
-    // the engine would quarantine them for the session. Leave the out-queue
-    // untouched and skip — the auth-state listener wakes the loop the instant a
-    // session lands (and the idle backstop re-checks meanwhile), so the held
-    // rows flush rather than being lost or quarantined.
-    if (!_hasLiveSession) return;
+    if (!_syncingEnabled ||
+        !_hasLiveSession ||
+        _outgoingRetryParked(syncable)) {
+      return;
+    }
 
     final outQueue = _outQueues[syncable]!;
+    if (outQueue.isEmpty) return;
+
     final backendTable = _backendTables[syncable]!;
     final quarantined = _outgoingQuarantined[syncable]!;
 
-    while (_syncingEnabled && outQueue.isNotEmpty) {
-      // GAM-389: push every queued row regardless of owner; RLS authorizes the
-      // write and onConflict:id makes it an idempotent upsert.
-      //
-      // Skip rows the backend has permanently rejected (quarantined): a single
-      // poison row must never re-wedge the whole table (MC-424 §B). A row whose
-      // version moved on since it was quarantined (a local edit that may fix the
-      // rejection) is let through to retry. The same versioned skip applies to
-      // rows deferred because their circle key is unavailable.
-      final outgoing = outQueue.values
-          .where((s) {
-            final failedAt = quarantined[s.id];
-            return failedAt == null || s.updatedAt.isAfter(failedAt);
-          })
-          .where((s) => !_isEncryptionDeferred(syncable, s))
-          .toSet();
-      outQueue.clear();
+    // Snapshot then clear so quarantined/deferred rows do not keep idle() hot.
+    // Requeue only eligible overflow and retryable failures.
+    final snapshot = outQueue.values.toList(growable: false);
+    outQueue.clear();
+    final eligible = snapshot
+        .where((row) {
+          final failedAt = quarantined[row.id];
+          return failedAt == null || row.updatedAt.isAfter(failedAt);
+        })
+        .where((row) => !_isEncryptionDeferred(syncable, row))
+        .toList(growable: false);
 
-      if (outgoing.isEmpty) continue;
+    final outgoing = eligible.take(_maxRows).toSet();
+    for (final row in eligible.skip(_maxRows)) {
+      _enqueueKeepingNewest(outQueue, row);
+    }
+    if (outgoing.isEmpty) return;
 
-      assert(!outgoing.any((s) => s.userId?.isEmpty ?? true));
+    final inFlight = _outgoingInFlight[syncable]!;
+    inFlight.addAll(outgoing);
+    try {
+      assert(!outgoing.any((row) => row.userId?.isEmpty ?? true));
 
-      // Encode rows for the wire (the field-encryption seam) concurrently:
-      // fold registered content fields into the blob according to the
-      // circle's mode. Rows that cannot be encrypted yet (missing circle key
-      // in enforced mode) are deferred — withheld from the wire, never
-      // dropped.
       final encoded = <Syncable, Map<String, dynamic>>{};
       final encodeResults = await Future.wait(
         outgoing.map(
@@ -1904,11 +1994,9 @@ class SyncManager<T extends SyncableDatabase> {
         ),
       );
       for (final result in encodeResults) {
-        final payload = result.payload;
-        if (payload != null) encoded[result.row] = payload;
+        if (result.payload != null) encoded[result.row] = result.payload!;
       }
-
-      if (encoded.isEmpty) continue;
+      if (encoded.isEmpty) return;
 
       _logger.info(
         'Syncing ${encoded.length} items to backend table $backendTable',
@@ -1917,30 +2005,21 @@ class SyncManager<T extends SyncableDatabase> {
       try {
         await _upsertPayloads(backendTable, encoded.values);
         await _markPushed(syncable, encoded.keys.toSet());
+        _clearOutgoingRetry(syncable);
       } on PostgrestException catch (batchError) {
         if (_isTransientPostgrest(batchError) ||
             _isSessionlessRlsRejection(batchError)) {
-          // Transient (429/5xx), OR a 42501 reached without a live session: the
-          // session dropped between the gate check and the round-trip, so the
-          // whole batch went out as `anon` and the rejection is an auth artifact,
-          // not a real verdict (MC-442). Either way re-enqueue the WHOLE batch
-          // and back off — never fall through to per-row, which would quarantine
-          // healthy rows over a passing hiccup or an anon rejection (MC-424 §B/§C).
           for (final row in encoded.keys) {
             _enqueueKeepingNewest(outQueue, row);
           }
           _logger.warning(
             'Re-enqueuing batch to $backendTable after a retryable rejection '
-            '($batchError); will retry',
+            '($batchError); backing off',
           );
+          _scheduleOutgoingRetry(syncable);
           return;
         }
 
-        // A permanent rejection of at least one row in the batch (constraint /
-        // RLS / check). Previously this threw out of the whole table push and
-        // wedged every other row — and every later table — until the poison row
-        // was gone. Instead, retry row-by-row so the good rows still flush and
-        // the poison row is isolated (MC-424 §B).
         _logger.warning(
           'Batch upsert to $backendTable rejected ($batchError); '
           'falling back to per-row',
@@ -1955,16 +2034,8 @@ class SyncManager<T extends SyncableDatabase> {
           } on PostgrestException catch (rowError, rowStack) {
             if (_isTransientPostgrest(rowError) ||
                 _isSessionlessRlsRejection(rowError)) {
-              // Transient (rate limit / server error), or a 42501 reached after
-              // the session dropped mid-fallback (an `anon` artifact, MC-442) —
-              // keep for retry; do NOT quarantine over a passing backend failure
-              // or a verdict reached without a live auth context.
               retry.add(row);
             } else {
-              // Permanent rejection of this specific row. Quarantine at this
-              // version + report; the row stays in the local db with dirty=true,
-              // so NOTHING is lost — it stops jamming the queue, and a later edit
-              // (newer updatedAt) or a restart gives it another chance.
               quarantined[row.id] = row.updatedAt;
               _logger.severe(
                 'Quarantined poison row ${row.id} in $backendTable after '
@@ -1972,33 +2043,31 @@ class SyncManager<T extends SyncableDatabase> {
               );
             }
           } catch (_) {
-            // Transient (e.g. network dropped mid-fallback) — keep for retry.
             retry.add(row);
           }
         }
 
         await _markPushed(syncable, succeeded);
+        if (succeeded.isNotEmpty) _clearOutgoingRetry(syncable);
 
         if (retry.isNotEmpty) {
-          // Re-enqueue the rows we never got a verdict on so the next loop pass
-          // retries them, then back off (don't spin this pass).
           for (final row in retry) {
             _enqueueKeepingNewest(outQueue, row);
           }
-          return;
+          _scheduleOutgoingRetry(syncable);
         }
       } catch (batchError) {
-        // Transient failure (network, etc.): re-enqueue the whole batch so it is
-        // retried next pass — never dropped (MC-424 §C) — and back off.
         for (final row in encoded.keys) {
           _enqueueKeepingNewest(outQueue, row);
         }
         _logger.warning(
           'Transient failure pushing to $backendTable ($batchError); '
-          'will retry',
+          'backing off',
         );
-        return;
+        _scheduleOutgoingRetry(syncable);
       }
+    } finally {
+      inFlight.removeAll(outgoing);
     }
   }
 
