@@ -221,6 +221,272 @@ void main() {
     await testDb.close();
   });
 
+  group('Sync status', () {
+    late SyncManager<TestDatabase> manager;
+
+    setUp(() {
+      manager = SyncManager<TestDatabase>(
+        localDatabase: testDb,
+        supabaseClient: mockSupabaseClient,
+        syncInterval: const Duration(hours: 1),
+        random: FixedRandom(0.5),
+      );
+      manager.registerSyncable<Item>(
+        backendTable: itemsTable,
+        fromJson: Item.fromJson,
+        companionConstructor: ItemsCompanion.new,
+      );
+      addTearDown(manager.dispose);
+    });
+
+    Future<void> start() async {
+      manager.setUserId(const Uuid().v4());
+      manager.enableSync();
+      await manager.syncTables();
+    }
+
+    Future<void> addItem() => testDb
+        .into(testDb.items)
+        .insert(
+          ItemsCompanion(
+            userId: drift.Value(manager.userId),
+            updatedAt: drift.Value(DateTime.now()),
+            name: const drift.Value('Status item'),
+          ),
+        )
+        .then((_) {});
+
+    test(
+      'automatic checks publish start and completion to multiple listeners',
+      () async {
+        final held = Completer<Response>();
+        when(
+          mockHttpClient.get(any, headers: anyNamed('headers')),
+        ).thenAnswer((_) => held.future);
+        final first = <SyncStatus>[];
+        final second = <SyncStatus>[];
+        final a = manager.statusStream.listen(first.add);
+        final b = manager.statusStream.listen(second.add);
+        addTearDown(a.cancel);
+        addTearDown(b.cancel);
+        expect(manager.status.enabled, isFalse);
+        manager.setUserId(const Uuid().v4());
+        manager.enableSync();
+        await waitForFunctionToPass(() async {
+          expect(first.any((s) => s.checking), isTrue);
+          expect(second.any((s) => s.checking), isTrue);
+        });
+        expect(manager.status.lastCheckedAt, isNull);
+        held.complete(Response('[]', 200, request: Request('GET', Uri())));
+        await manager.syncTables();
+        await waitForFunctionToPass(() async {
+          expect(first.last.isBusy, isFalse);
+          expect(first.last.lastCheckedAt, isNotNull);
+        });
+        expect(manager.status.pendingUploads, 0);
+        expect(manager.status.hasFailures, isFalse);
+      },
+    );
+
+    test(
+      'downloads stay active during a held fetch and settle after local writes',
+      () async {
+        await start();
+        final item = Item(
+          id: const Uuid().v4(),
+          userId: manager.userId,
+          updatedAt: DateTime.now().toUtc(),
+          deleted: false,
+          name: 'Downloaded',
+        );
+        final held = Completer<Response>();
+        when(mockHttpClient.get(any, headers: anyNamed('headers'))).thenAnswer((
+          inv,
+        ) {
+          final uri = inv.positionalArguments[0] as Uri;
+          if (uri.queryParameters['select'] == 'id,updated_at') {
+            return Future.value(
+              Response(
+                jsonEncode([item.toJson()]),
+                200,
+                request: Request('GET', uri),
+              ),
+            );
+          }
+          return held.future;
+        });
+        final check = manager.syncTables();
+        await waitForFunctionToPass(() async {
+          expect(manager.status.downloading, isTrue);
+        });
+        held.complete(
+          Response(
+            jsonEncode([item.toJson()]),
+            200,
+            request: Request('GET', Uri()),
+          ),
+        );
+        await check;
+        expect(manager.status.downloading, isFalse);
+        expect(manager.status.pendingDownloads, 0);
+        expect(
+          (await testDb.select(testDb.items).getSingle()).name,
+          'Downloaded',
+        );
+        expect(manager.status.hasFailures, isFalse);
+      },
+    );
+
+    test('an upload stays active after its queue has been cleared', () async {
+      await start();
+      final held = Completer<Response>();
+      when(
+        mockHttpClient.post(
+          any,
+          headers: anyNamed('headers'),
+          body: anyNamed('body'),
+          encoding: anyNamed('encoding'),
+        ),
+      ).thenAnswer((_) => held.future);
+      await addItem();
+      await waitForFunctionToPass(() async {
+        expect(manager.status.uploading, isTrue);
+        expect(manager.status.pendingUploads, 1);
+      });
+      expect(
+        manager.isSyncingToBackend,
+        isFalse,
+        reason: 'the old queue flag misses the active request',
+      );
+      held.complete(Response('[]', 200, request: Request('POST', Uri())));
+      await waitForFunctionToPass(() async {
+        expect(manager.status.uploading, isFalse);
+        expect(manager.status.pendingUploads, 0);
+      });
+    });
+
+    test(
+      'a failed server check does not advance the successful check time',
+      () async {
+        await start();
+        final lastCheck = manager.status.lastCheckedAt;
+        when(mockHttpClient.get(any, headers: anyNamed('headers'))).thenAnswer(
+          (_) async => Response(
+            '{"code":"503","message":"Unavailable"}',
+            503,
+            request: Request('GET', Uri()),
+            headers: {'content-type': 'application/json'},
+          ),
+        );
+        await expectLater(
+          manager.syncTables(),
+          throwsA(isA<PostgrestException>()),
+        );
+        expect(manager.status.checkFailed, isTrue);
+        expect(manager.status.isBusy, isFalse);
+        expect(manager.status.lastCheckedAt, lastCheck);
+        when(mockHttpClient.get(any, headers: anyNamed('headers'))).thenAnswer(
+          (_) async => Response('[]', 200, request: Request('GET', Uri())),
+        );
+        await manager.syncTables();
+        expect(manager.status.checkFailed, isFalse);
+        expect(manager.status.lastCheckedAt!.isAfter(lastCheck!), isTrue);
+      },
+    );
+
+    test(
+      'retry backoff reports waiting changes without an active upload',
+      () async {
+        await start();
+        when(
+          mockHttpClient.post(
+            any,
+            headers: anyNamed('headers'),
+            body: anyNamed('body'),
+            encoding: anyNamed('encoding'),
+          ),
+        ).thenAnswer(
+          (_) async => Response(
+            '{"code":"503","message":"Unavailable"}',
+            503,
+            request: Request('POST', Uri()),
+            headers: {'content-type': 'application/json'},
+          ),
+        );
+        await addItem();
+        await waitForFunctionToPass(() async {
+          expect(manager.status.retryScheduled, isTrue);
+          expect(manager.status.uploading, isFalse);
+          expect(manager.status.pendingUploads, 1);
+        });
+        expect(manager.status.failedUploads, 0);
+      },
+    );
+
+    test(
+      'permanently rejected changes remain visible after the queue drains',
+      () async {
+        await start();
+        when(
+          mockHttpClient.post(
+            any,
+            headers: anyNamed('headers'),
+            body: anyNamed('body'),
+            encoding: anyNamed('encoding'),
+          ),
+        ).thenAnswer(
+          (_) async => Response(
+            '{"code":"42501","message":"Rejected"}',
+            403,
+            request: Request('POST', Uri()),
+            headers: {'content-type': 'application/json'},
+          ),
+        );
+        await addItem();
+        await waitForFunctionToPass(() async {
+          expect(manager.status.failedUploads, 1);
+          expect(manager.status.uploading, isFalse);
+        });
+        expect(manager.status.hasFailures, isTrue);
+        expect(manager.status.pendingUploads, 1);
+        expect(manager.status.isBusy, isFalse);
+        when(
+          mockHttpClient.post(
+            any,
+            headers: anyNamed('headers'),
+            body: anyNamed('body'),
+            encoding: anyNamed('encoding'),
+          ),
+        ).thenAnswer(
+          (_) async => Response('[]', 200, request: Request('POST', Uri())),
+        );
+        await manager.retryFailedChanges();
+        await waitForFunctionToPass(() async {
+          expect(manager.status.pendingUploads, 0);
+          expect(manager.status.failedUploads, 0);
+        });
+      },
+    );
+
+    test(
+      'disable does not manufacture a completed check; dispose closes the stream',
+      () async {
+        await manager.syncTables();
+        expect(manager.status.lastCheckedAt, isNull);
+        await start();
+        final lastCheck = manager.status.lastCheckedAt;
+        manager.disableSync();
+        expect(manager.status.enabled, isFalse);
+        expect(manager.status.lastCheckedAt, lastCheck);
+        final done = Completer<void>();
+        manager.statusStream.listen((_) {}, onDone: done.complete);
+        manager.dispose();
+        await done.future;
+        expect(manager.status.enabled, isFalse);
+      },
+    );
+  });
+
   test('Newly created items get sent to backend', () async {
     final syncManager = SyncManager(
       localDatabase: testDb,

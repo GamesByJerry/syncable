@@ -8,6 +8,7 @@ import 'package:supabase/supabase.dart';
 import 'package:syncable/src/encrypted_syncable.dart';
 import 'package:syncable/src/supabase_names.dart';
 import 'package:syncable/src/sync_field_cipher.dart';
+import 'package:syncable/src/sync_status.dart';
 import 'package:syncable/src/sync_timestamp_storage.dart';
 import 'package:syncable/src/syncable.dart';
 import 'package:syncable/src/syncable_database.dart';
@@ -126,6 +127,91 @@ class SyncManager<T extends SyncableDatabase> {
 
   final _logger = Logger('syncable');
 
+  final _statusController = StreamController<SyncStatus>.broadcast();
+  SyncStatus? _lastPublishedStatus;
+  bool _statusNotificationPending = false;
+  int _downloadsInFlight = 0;
+  int _incomingRowsInFlight = 0;
+  DateTime? _lastCheckedAt;
+  final _checkFailures = <Type>{};
+  final _decodeFailures = <Type, Set<String>>{};
+
+  /// Read this snapshot when attaching to [statusStream].
+  SyncStatus get status {
+    var pendingUploads = 0;
+    var pendingDownloads = _incomingRowsInFlight;
+    for (final type in _syncables) {
+      pendingUploads += {
+        ..._outQueues[type]!.keys,
+        ..._outgoingInFlight[type]!.map((row) => row.id),
+        ..._outgoingQuarantined[type]!.keys,
+        ..._encryptionDeferred[type]!.keys,
+      }.length;
+      pendingDownloads += {
+        ..._inQueues[type]!.map((row) => row.id),
+        ..._incomingQuarantined[type]!.keys,
+        ...?_decodeFailures[type],
+      }.length;
+    }
+    return SyncStatus(
+      enabled: _syncingEnabled,
+      checking: !_disposed && _sweepRunning && _syncingEnabled,
+      downloading: !_disposed && _downloadsInFlight > 0,
+      uploading:
+          !_disposed && _outgoingInFlight.values.any((rows) => rows.isNotEmpty),
+      pendingUploads: pendingUploads,
+      pendingDownloads: pendingDownloads,
+      failedUploads: _outgoingQuarantined.values.fold(
+        0,
+        (sum, rows) => sum + rows.length,
+      ),
+      failedDownloads:
+          _incomingQuarantined.values.fold(
+            0,
+            (sum, rows) => sum + rows.length,
+          ) +
+          _decodeFailures.values.fold(0, (sum, rows) => sum + rows.length),
+      deferredUploads: _encryptionDeferred.values.fold(
+        0,
+        (sum, rows) => sum + rows.length,
+      ),
+      retryScheduled:
+          !_disposed &&
+          _outgoingRetryTimers.values.any((timer) => timer.isActive),
+      checkFailed: _checkFailures.isNotEmpty,
+      lastCheckedAt: _lastCheckedAt,
+    );
+  }
+
+  /// Broadcast activity changes from automatic and manually requested syncs.
+  /// Read [status] for the initial snapshot. Notifications are coalesced within
+  /// a microtask so a received page does not rebuild the UI once per row.
+  Stream<SyncStatus> get statusStream => _statusController.stream;
+
+  void _notifyStatus() {
+    if (_disposed || _statusNotificationPending) return;
+    _statusNotificationPending = true;
+    scheduleMicrotask(() {
+      _statusNotificationPending = false;
+      if (_disposed) return;
+      final next = status;
+      if (next == _lastPublishedStatus) return;
+      _lastPublishedStatus = next;
+      _statusController.add(next);
+    });
+  }
+
+  Future<R> _trackDownload<R>(Future<R> Function() operation) async {
+    _downloadsInFlight++;
+    _notifyStatus();
+    try {
+      return await operation();
+    } finally {
+      _downloadsInFlight--;
+      _notifyStatus();
+    }
+  }
+
   final T _localDb;
   final SupabaseClient _supabaseClient;
   final SyncTimestampStorage? _syncTimestampStorage;
@@ -198,6 +284,8 @@ class SyncManager<T extends SyncableDatabase> {
   void setUserId(String value) {
     if (_userId == value) return;
     _userId = value;
+    _lastCheckedAt = null;
+    _checkFailures.clear();
     _onDependenciesChanged("userId set to '$value'");
   }
 
@@ -351,6 +439,7 @@ class SyncManager<T extends SyncableDatabase> {
   int get nFullSyncs => _nFullSyncs;
 
   void dispose() {
+    if (_disposed) return;
     _disposed = true;
     // Some paths (_syncTables, _maybeSubscribe*) read the RAW __syncingEnabled
     // flag rather than the _disposed-aware getter, so clear it too: nothing must
@@ -372,6 +461,8 @@ class SyncManager<T extends SyncableDatabase> {
       subscription.cancel();
     }
     _backendSubscription?.unsubscribe();
+    _statusController.add(status);
+    unawaited(_statusController.close());
   }
 
   /// Registers a syncable table with the sync manager.
@@ -576,6 +667,7 @@ class SyncManager<T extends SyncableDatabase> {
   }
 
   void _wake() {
+    _notifyStatus();
     final signal = _wakeSignal;
     if (signal != null && !signal.isCompleted) {
       signal.complete();
@@ -1055,6 +1147,7 @@ class SyncManager<T extends SyncableDatabase> {
   }
 
   Future _onDependenciesChanged(String reason) async {
+    _notifyStatus();
     _maybeSubscribeToLocalChanges();
     _maybeSubscribeToBackendChanges();
 
@@ -1362,7 +1455,25 @@ class SyncManager<T extends SyncableDatabase> {
     await _syncTables('Manual sync', fullResync: fullResync);
   }
 
+  /// Explicitly retries rejected rows and flushes changes waiting on backoff.
+  /// Unlike automatic checks, this deliberately re-arms permanent failures.
+  Future<void> retryFailedChanges() async {
+    if (!_syncingEnabled) return;
+    for (final type in _syncables) {
+      final failedIds = _incomingQuarantined[type]!.keys.toSet();
+      _receivedItems[type]!.removeWhere((row) => failedIds.contains(row.id));
+      _incomingQuarantined[type]!.clear();
+      _outgoingQuarantined[type]!.clear();
+      _clearOutgoingRetry(type);
+    }
+    _decodeFailures.clear();
+    _notifyStatus();
+    _wake();
+    await syncTables(fullResync: true);
+  }
+
   Future<void> _syncTables(String reason, {bool fullResync = false}) async {
+    if (!_syncingEnabled) return;
     if (_sweepRunning) {
       _pendingSweep = true;
       _pendingFullResync = _pendingFullResync || fullResync;
@@ -1379,6 +1490,7 @@ class SyncManager<T extends SyncableDatabase> {
     }
 
     _sweepRunning = true;
+    _notifyStatus();
     final completion = _sweepCompletion = _SweepCompletion();
     Object? firstError;
     StackTrace? firstStack;
@@ -1408,6 +1520,7 @@ class SyncManager<T extends SyncableDatabase> {
       completion.stack = firstStack;
       _sweepRunning = false;
       _sweepCompletion = null;
+      _notifyStatus();
       if (!completion.completer.isCompleted) completion.completer.complete();
     }
   }
@@ -1428,14 +1541,20 @@ class SyncManager<T extends SyncableDatabase> {
 
     _logger.info('Syncing all tables. Reason: $reason (user: $_userId)');
 
+    final sweepUser = userId;
+    var checkedAll = true;
     Object? firstError;
     StackTrace? firstStack;
     for (final syncable in _syncables) {
       try {
-        await _syncTable(syncable, fullResync: fullResync);
+        checkedAll =
+            await _syncTable(syncable, fullResync: fullResync) && checkedAll;
       } catch (e, st) {
+        checkedAll = false;
         firstError ??= e;
         firstStack ??= st;
+        _checkFailures.add(syncable);
+        _notifyStatus();
         _logger.severe(
           'Sweep failed at table ${_backendTables[syncable]}',
           e,
@@ -1446,19 +1565,22 @@ class SyncManager<T extends SyncableDatabase> {
       }
     }
 
+    if (checkedAll && _syncingEnabled && userId == sweepUser) {
+      _lastCheckedAt = DateTime.now().toUtc();
+    }
     _nFullSyncs++;
     if (firstError != null) {
       Error.throwWithStackTrace(firstError, firstStack!);
     }
   }
 
-  Future<void> _syncTable(Type syncable, {bool fullResync = false}) async {
+  Future<bool> _syncTable(Type syncable, {bool fullResync = false}) async {
     final backendTable = _backendTables[syncable];
     final localTable = _localTables[syncable]!;
 
     if (!_syncingEnabled) {
       _logger.info('Sweep $backendTable: skipped (syncing disabled)');
-      return;
+      return false;
     }
 
     // Push discovery needs complete models, but only dirty ones. Pull conflict
@@ -1483,7 +1605,7 @@ class SyncManager<T extends SyncableDatabase> {
 
     if (!_syncingEnabled) {
       _logger.info('Sweep $backendTable: skipped (syncing disabled mid-sweep)');
-      return;
+      return false;
     }
 
     final queued = _pushLocalChangesToOutQueue(syncable, dirtyItems);
@@ -1494,7 +1616,7 @@ class SyncManager<T extends SyncableDatabase> {
         'Sweep $backendTable: queued $queued for push, pull skipped '
         '(no other device active since last sync)',
       );
-      return;
+      return false;
     }
 
     final pullStartedAt = DateTime.now().toUtc();
@@ -1509,12 +1631,14 @@ class SyncManager<T extends SyncableDatabase> {
         _logger.info(
           'Sweep $backendTable: aborted (syncing disabled mid-pull)',
         );
-        return;
+        return false;
       }
-      final pulledBatch = await _supabaseClient
-          .from(_backendTables[syncable]!)
-          .select()
-          .inFilter(idKey, batch);
+      final pulledBatch = await _trackDownload(
+        () => _supabaseClient
+            .from(_backendTables[syncable]!)
+            .select()
+            .inFilter(idKey, batch),
+      );
 
       await Future.wait(
         pulledBatch.map((wireRow) => _enqueueIncoming(syncable, wireRow)),
@@ -1526,13 +1650,16 @@ class SyncManager<T extends SyncableDatabase> {
       await _processIncoming(syncable);
     }
 
+    if (!_syncingEnabled) return false;
     await _updateLastPulledTimeStamp(syncable, pullStartedAt);
+    _checkFailures.remove(syncable);
 
     _logger.info(
       'Sweep $backendTable: queued $queued for push, pulled '
       '${itemsToPull.length} of ${backendItems.length} backend candidates '
       '(full metadata reconciliation)',
     );
+    return true;
   }
 
   bool _skipSyncFromBackend(Type syncable) {
@@ -1618,8 +1745,13 @@ class SyncManager<T extends SyncableDatabase> {
   ) async {
     final Syncable item;
     try {
-      item = await _decodeIncoming(syncable, wireRow);
+      item = await _trackDownload(() => _decodeIncoming(syncable, wireRow));
+      _decodeFailures[syncable]?.remove(wireRow[idKey]);
     } catch (e, s) {
+      (_decodeFailures[syncable] ??= {}).add(
+        wireRow[idKey]?.toString() ?? '<unknown>',
+      );
+      _notifyStatus();
       // coverage:ignore-start
       _logger.severe(
         'Failed to decode incoming row for table '
@@ -1983,6 +2115,7 @@ class SyncManager<T extends SyncableDatabase> {
 
     final inFlight = _outgoingInFlight[syncable]!;
     inFlight.addAll(outgoing);
+    _notifyStatus();
     try {
       assert(!outgoing.any((row) => row.userId?.isEmpty ?? true));
 
@@ -2068,6 +2201,7 @@ class SyncManager<T extends SyncableDatabase> {
       }
     } finally {
       inFlight.removeAll(outgoing);
+      _notifyStatus();
     }
   }
 
@@ -2234,6 +2368,16 @@ class SyncManager<T extends SyncableDatabase> {
 
     final table = _localTables[syncable]!;
     _sentItems[syncable]!.addAll(pushed);
+    for (final row in pushed) {
+      final deferred = _encryptionDeferred[syncable]![row.id];
+      if (deferred != null && !deferred.updatedAt.isAfter(row.updatedAt)) {
+        _encryptionDeferred[syncable]!.remove(row.id);
+      }
+      final failedAt = _outgoingQuarantined[syncable]![row.id];
+      if (failedAt != null && !failedAt.isAfter(row.updatedAt)) {
+        _outgoingQuarantined[syncable]!.remove(row.id);
+      }
+    }
 
     // The pushed rows are now in sync with the backend — clear their dirty flag
     // so they are not re-pushed next cycle / after a restart. Guard each clear on
@@ -2264,6 +2408,18 @@ class SyncManager<T extends SyncableDatabase> {
   }
 
   Future<void> _processIncoming(Type syncable) async {
+    final count = _inQueues[syncable]!.length;
+    if (count == 0) return;
+    _incomingRowsInFlight += count;
+    try {
+      await _trackDownload(() => _applyIncoming(syncable));
+    } finally {
+      _incomingRowsInFlight -= count;
+      _notifyStatus();
+    }
+  }
+
+  Future<void> _applyIncoming(Type syncable) async {
     final inQueue = _inQueues[syncable]!;
 
     if (inQueue.isEmpty) return;
@@ -2435,6 +2591,12 @@ class SyncManager<T extends SyncableDatabase> {
 
       await _applyPendingLockedBlobs<S>(syncable, table, writes);
     });
+    for (final write in writes) {
+      final failedAt = _incomingQuarantined[syncable]![write.id];
+      if (failedAt != null && !failedAt.isAfter(write.updatedAt)) {
+        _incomingQuarantined[syncable]!.remove(write.id);
+      }
+    }
   }
 
   /// Applies the locked-blob instructions produced at decode time to the rows
