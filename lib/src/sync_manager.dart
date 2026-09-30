@@ -2591,10 +2591,21 @@ class SyncManager<T extends SyncableDatabase> {
 
       await _applyPendingLockedBlobs<S>(syncable, table, writes);
     });
+    // A durably applied backend version also resolves an older failed or
+    // deferred upload of that row. Keep newer local failures pending.
     for (final write in writes) {
-      final failedAt = _incomingQuarantined[syncable]![write.id];
-      if (failedAt != null && !failedAt.isAfter(write.updatedAt)) {
-        _incomingQuarantined[syncable]!.remove(write.id);
+      for (final failures in [
+        _incomingQuarantined[syncable]!,
+        _outgoingQuarantined[syncable]!,
+      ]) {
+        final failedAt = failures[write.id];
+        if (failedAt != null && !failedAt.isAfter(write.updatedAt)) {
+          failures.remove(write.id);
+        }
+      }
+      final deferred = _encryptionDeferred[syncable]![write.id];
+      if (deferred != null && !deferred.updatedAt.isAfter(write.updatedAt)) {
+        _encryptionDeferred[syncable]!.remove(write.id);
       }
     }
   }

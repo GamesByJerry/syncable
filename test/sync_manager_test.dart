@@ -877,6 +877,10 @@ void main() {
           ),
         );
 
+    await waitForFunctionToPass(() async {
+      expect(syncManager.status.failedUploads, 1);
+    });
+
     // The backend holds a NEWER version of the SAME id — e.g. another device
     // fixed it. With a shared quarantine this pull would be dropped; with the
     // outgoing/incoming split it must land.
@@ -910,6 +914,8 @@ void main() {
         reason: 'incoming pull must not be blocked by the outgoing quarantine',
       );
       expect(row.dirty, isFalse, reason: 'pulled row is clean');
+      expect(syncManager.status.failedUploads, 0);
+      expect(syncManager.status.pendingUploads, 0);
     });
 
     syncManager.dispose();
