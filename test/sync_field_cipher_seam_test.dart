@@ -615,6 +615,9 @@ void main() {
       );
       expect(alerts.single.severity, SyncEncryptionAlertSeverity.info);
       expect((await localRow(item.id)).dirty, isTrue);
+      expect(syncManager.status.deferredUploads, 1);
+      expect(syncManager.status.pendingUploads, 1);
+      expect(syncManager.status.uploading, isFalse);
 
       // The key lands (MC-428 will deliver it) — retry unblocks the push.
       cipher.keys[circleId] = {1};
@@ -627,6 +630,10 @@ void main() {
       expect(row[titleKey], isNull);
       expect(row[contentEncKey], isNotNull);
       expect((await localRow(item.id)).dirty, isFalse);
+      await waitForFunctionToPass(() async {
+        expect(syncManager.status.deferredUploads, 0);
+        expect(syncManager.status.pendingUploads, 0);
+      });
 
       syncManager.dispose();
     });
